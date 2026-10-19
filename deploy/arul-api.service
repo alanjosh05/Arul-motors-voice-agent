@@ -1,0 +1,17 @@
+[Unit]
+Description=Arul Motors dashboard API (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=arul
+WorkingDirectory=/opt/arul-motors
+# API_KEY, CORS_ORIGINS etc. Same .env, same SQLite file as the voice agent.
+EnvironmentFile=/opt/arul-motors/.env
+# Only Caddy (same machine) talks to it.
+ExecStart=/opt/arul-motors/.venv/bin/uvicorn api:app --host 127.0.0.1 --port 8001 --proxy-headers
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=Arul Motors voice agent (Pipecat + Gemini Live on Vertex AI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=arul
+WorkingDirectory=/opt/arul-motors
+# MySQL credentials etc. Vertex needs no key: the VM's service account is used.
+EnvironmentFile=/opt/arul-motors/.env
+# STUN lets the browser reach the VM through Google Cloud's NAT.
+Environment=PIPECAT_ICE_SERVERS=stun:stun.l.google.com:19302
+# Only Caddy (same machine) talks to it; WebRTC audio itself goes over UDP.
+ExecStart=/opt/arul-motors/.venv/bin/python bot.py --host 127.0.0.1 --port 7860 -t webrtc --allowed-origins https://VOICE_DOMAIN
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

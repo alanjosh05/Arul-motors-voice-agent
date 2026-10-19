@@ -1,0 +1,11 @@
+pipecat-ai[google,webrtc,runner]~=1.12.0
+pipecat-ai-prebuilt>=1.0.6
+python-dotenv
+fastapi
+uvicorn
+httpx
+pymysql>=1.1
+
+# dev
+pytest
+pytest-asyncio

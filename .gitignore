@@ -1,0 +1,17 @@
+# Environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Database
+*.db
+
+# Google Cloud credentials (never commit)
+application_default_credentials.json
+*.json
+*.db-wal
+*.db-shm
