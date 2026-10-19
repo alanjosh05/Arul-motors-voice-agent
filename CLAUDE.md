@@ -27,8 +27,12 @@ the bike in (date only, no time slots). That date is stored in SQLite.
 | Pipecat 1.12 | Orchestrator: audio ↔ Gemini, turn-taking, barge-in, tool calls (`bot.py`) |
 | Gemini Live on Vertex AI | Speech-to-speech agent (`gemini-3.8-live`, `us-central1`). Listens, decides, speaks, calls tools |
 | Database (`database.py`) | **SQLite** (WAL mode) on the VM, shared by bot and API. Customers, bikes, service appointments, call logs. Showroom clock is IST. MySQL support is built in but unused (`MYSQL_HOST`) |
-| FastAPI (`api.py`) | Dashboard API on the VM at `api.` domain, protected by `API_KEY` (X-API-Key) and `CORS_ORIGINS` |
-| Frontend | **GoDaddy** hosting; calls the API. GoDaddy also holds DNS (`voice.`/`api.` → VM static IP) |
+| FastAPI (`api.py`) | CRM API on the VM at `backend.arulmotors.com`: staff logins (`auth.py`, scrypt + HMAC tokens, `AUTH_SECRET`), CRUD for customers/bikes/bookings, `/api/stats`, call relay `/api/voice/offer` → bot |
+| Service types | `service_types` table (seeded with First/Second/Third free, Paid, General check-up), managed in the CRM's Service types page; bikes/bookings store the type name, renames cascade |
+| Performance | Indexes (`database.INDEXES`); event-versioned JSON cache + ETag/304 + gzip in `api.py`; DB endpoints are sync `def` (thread pool). **Run one API process** (hub/cache/throttle are in-process). Frontend lazy-loads Pipecat, recharts, ⌘K and dialogs |
+| Live updates | `events` + `voice_calls` tables written by bot and API; `api.py` streams new events over WebSocket `/api/ws?token=` (`LiveHub`, 0.75 s poll); frontend `components/live-provider.tsx` |
+| CRM frontend (`../frontend`) | Next.js 16 + TypeScript + shadcn/ui (Nova/Radix), static export → GoDaddy (`crm.arulmotors.com`). Starts agent calls in the browser via the API relay |
+| DNS | **Cloudflare** (not GoDaddy): `voice.`, `backend.` → VM static IP 34.93.71.71, DNS only |
 | Hosting (`deploy/`) | **Whole backend on one GCP VM** in `asia-south1`: Caddy (HTTPS, basic auth on voice), systemd services `arul-voice` + `arul-api`, daily disk snapshots (14 days). VM service account has `roles/aiplatform.user` (ADC, no keys) |
 | Transport | Browser/WebRTC only (`/client` on port 7860). **Plivo is commented out** pending the client's decision |
 
@@ -147,9 +151,11 @@ enabled:
 3. Customer consent for calls; DPDP Act 2023 handling of names and mobile numbers.
 4. Production hosting (India) with Workload Identity Federation for Vertex.
 5. Revoke the old AI Studio API key in AI Studio. It has been removed from `.env` and the backup copy deleted.
-6. Staff login for the dashboard: `API_KEY` sits in frontend JavaScript, so it is not a real secret.
+6. Deploy the CRM: build `../frontend`, upload `out/` to GoDaddy, set `CORS_ORIGINS`, create the first admin (`api.py create-user`).
 
 ## Rules for working on this code
+
+- Keep the agent prompt short (it's re-read every turn: 932 tokens with tools). Measure with Vertex `count_tokens` before and after edits. Guardrails (STRICT SCOPE) and `CallGuard` hang-up rules must stay.
 
 - `database.py` must keep working on both SQLite and MySQL: write SQL with `?`
   placeholders (converted for MySQL), keep dates as `YYYY-MM-DD` strings, put

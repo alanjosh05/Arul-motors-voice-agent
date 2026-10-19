@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -47,6 +48,17 @@ SERVICE_SEQUENCE = [
     "Second free service",
     "Offer free service",
     "Paid service",
+]
+
+# Service types created in a new database (editable in the CRM). Intervals
+# are starting points: when the next service of this type falls due after the
+# previous one (days / km). None = on demand, not part of the schedule.
+DEFAULT_SERVICE_TYPES = [
+    ("First free service", "First free check-up after purchase.", 1, 30, 1000),
+    ("Second free service", "Second free service.", 1, 90, 4000),
+    ("Third free service", "Third free service.", 1, 180, 8000),
+    ("Paid service", "Regular paid service after the free services.", 0, 120, 4000),
+    ("General check-up", "Inspection for a problem the customer reports.", 0, None, None),
 ]
 
 # Outcomes the agent may record for a follow-up call.
@@ -136,10 +148,12 @@ def _connect():
     if using_mysql():
         return _connect_mysql()
     # The voice agent and the API are separate processes sharing this file.
-    # WAL lets one read while the other writes; the timeout makes a writer
-    # wait for the other's write instead of failing with "database is locked".
+    # WAL (enabled once in init_db; it persists in the file) lets one read
+    # while the other writes; the timeout makes a writer wait for the other's
+    # write instead of failing with "database is locked". synchronous=NORMAL is
+    # safe with WAL and avoids an fsync on every commit.
     conn = sqlite3.connect(DB_FILE, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -168,9 +182,41 @@ def _plain(row) -> dict:
     }
 
 
+def _ensure_index(cursor, name: str, table: str, columns: str) -> None:
+    """CREATE INDEX IF NOT EXISTS for both SQLite and MySQL."""
+    if using_mysql():
+        cursor.execute(
+            "SELECT 1 FROM information_schema.statistics WHERE table_schema = DATABASE() "
+            "AND table_name = ? AND index_name = ? LIMIT 1",
+            (table, name),
+        )
+        if cursor.fetchone():
+            return
+        cursor.execute(f"CREATE INDEX {name} ON {table} ({columns})")
+    else:
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})")
+
+
+# Indexes for the lookups the CRM, the agent and the live feed make.
+INDEXES = [
+    ("ix_vehicles_customer", "vehicles", "customer_id"),
+    ("ix_vehicles_next_due", "vehicles", "next_service_date"),
+    ("ix_appts_customer", "service_appointments", "customer_id"),
+    ("ix_appts_vehicle_status", "service_appointments", "vehicle_id, status"),
+    ("ix_appts_status_date", "service_appointments", "status, appointment_date"),
+    ("ix_calls_customer", "call_logs", "customer_id, id"),
+    ("ix_calls_created", "call_logs", "created_at"),
+    ("ix_events_type", "events", "type, id"),
+    ("ix_events_ref", "events", "event_ref"),
+    ("ix_voice_calls_open", "voice_calls", "ended_at, started_at"),
+]
+
+
 def init_db():
     """Initialize the database with tables and seed demo customers."""
     conn = _connect()
+    if not using_mysql():
+        conn.execute("PRAGMA journal_mode=WAL")
     cursor = conn.cursor()
 
     t = _schema()
@@ -241,6 +287,69 @@ def init_db():
     ) {t['table']}
     """)
 
+    # CRM staff logins (dashboard users). Passwords are stored as scrypt hashes.
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS staff_users (
+        id {t['pk']},
+        username {t['str']} NOT NULL UNIQUE,
+        full_name {t['str']},
+        password_hash TEXT NOT NULL,
+        role {t['id']} NOT NULL DEFAULT 'staff',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) {t['table']}
+    """)
+
+    # Service types offered by the workshop, managed from the CRM. Bikes and
+    # bookings store the type's name; `interval_days` / `interval_km` say when
+    # the next service of this type falls due (empty = on-demand type).
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS service_types (
+        id {t['pk']},
+        name {t['str']} NOT NULL UNIQUE,
+        description TEXT,
+        is_free INTEGER NOT NULL DEFAULT 0,
+        interval_days INTEGER,
+        interval_km INTEGER,
+        price INTEGER,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) {t['table']}
+    """)
+    cursor.execute("SELECT count(*) AS n FROM service_types")
+    if cursor.fetchone()["n"] == 0:
+        for order, (name, description, is_free, days, km) in enumerate(DEFAULT_SERVICE_TYPES, start=1):
+            cursor.execute(
+                "INSERT INTO service_types (name, description, is_free, interval_days, interval_km, sort_order) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, description, is_free, days, km, order),
+            )
+
+    # Change feed for the CRM's live updates. Both the voice agent and the API
+    # append events here; the API streams new rows to browsers over WebSocket.
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS events (
+        id {t['pk']},
+        type {t['str']} NOT NULL,
+        event_ref {t['str']},
+        payload TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) {t['table']}
+    """)
+
+    # Voice-agent calls: open rows (ended_at NULL) are calls in progress.
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS voice_calls (
+        id {t['pk']},
+        customer_id INTEGER NOT NULL,
+        customer_name {t['str']},
+        started_by {t['str']},
+        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ended_at TIMESTAMP NULL,
+        outcome {t['str']}
+    ) {t['table']}
+    """)
+
     # [Plivo disabled — pending client decision on telephony]
     # # Maps a Plivo call UUID to the customer being called. Plivo's media stream
     # # only carries the call UUID, so the bot looks the customer up here.
@@ -251,6 +360,9 @@ def init_db():
     #     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     # )
     # """)
+
+    for name, table, columns in INDEXES:
+        _ensure_index(cursor, name, table, columns)
 
     # Seed demo customers if empty. Dates are relative to today so the demo
     # always has upcoming services to call about.
@@ -502,6 +614,7 @@ def add_customer_vehicle(
     )
     conn.commit()
     conn.close()
+    _record_change(["customers", "vehicles", "due", "stats"], customer_id)
     return (True, f"{registration_number} added for {name}.")
 
 
@@ -533,11 +646,13 @@ def create_appointment(
     registration_number: str | None = None,
     service_type: str | None = None,
     notes: str | None = None,
+    actor: str = "agent",
 ) -> tuple[bool, str, str | None]:
     """Create a service appointment for one of the customer's bikes.
 
-    `service_type` defaults to the bike's next due service. Returns
-    (success, message, appointment_id).
+    `service_type` defaults to the bike's next due service. `actor` is "agent"
+    (voice agent) or "staff:<username>"; agent bookings notify the staff.
+    Returns (success, message, appointment_id).
     """
     conn = _connect()
     cursor = conn.cursor()
@@ -577,6 +692,14 @@ def create_appointment(
     )
     conn.commit()
     conn.close()
+    _record_change(BOOKING_ENTITIES, customer_id)
+    if actor == "agent":
+        notify(
+            "booking_created", "success",
+            f"Service booked · {_customer_name(customer_id)}",
+            f"{vehicle['model']} ({vehicle['registration_number']}) on {_human_day(day)} · {service}",
+            customer_id, ref=f"booking:{appointment_id}",
+        )
     return (
         True,
         f"Appointment {appointment_id} created: {vehicle['model']} ({vehicle['registration_number']}) "
@@ -631,6 +754,7 @@ def update_appointment(
     appointment_id: str | None = None,
     new_date: str | None = None,
     notes: str | None = None,
+    actor: str = "agent",
 ) -> tuple[bool, str]:
     """Change the date and/or the notes of one of the customer's appointments."""
     if not new_date and notes is None:
@@ -661,10 +785,20 @@ def update_appointment(
         changes.append("notes updated")
     conn.commit()
     conn.close()
+    _record_change(BOOKING_ENTITIES, customer_id)
+    if actor == "agent" and new_date:
+        notify(
+            "booking_rescheduled", "info",
+            f"Booking moved · {_customer_name(customer_id)}",
+            f"{appointment['id']}: {_human_day(appointment['appointment_date'])} → {_human_day(day)}",
+            customer_id,
+        )
     return (True, f"Appointment {appointment['id']} updated: {', '.join(changes)}.")
 
 
-def cancel_appointment(customer_id: int, appointment_id: str | None = None) -> tuple[bool, str]:
+def cancel_appointment(
+    customer_id: int, appointment_id: str | None = None, actor: str = "agent"
+) -> tuple[bool, str]:
     """Cancel (soft-delete) an appointment; the row is kept with status CANCELLED."""
     conn = _connect()
     cursor = conn.cursor()
@@ -677,6 +811,14 @@ def cancel_appointment(customer_id: int, appointment_id: str | None = None) -> t
     )
     conn.commit()
     conn.close()
+    _record_change(BOOKING_ENTITIES, customer_id)
+    if actor == "agent":
+        notify(
+            "booking_cancelled", "warning",
+            f"Booking cancelled · {_customer_name(customer_id)}",
+            f"{appointment['id']} for {_human_day(appointment['appointment_date'])} was cancelled on the call.",
+            customer_id,
+        )
     return (
         True,
         f"Appointment {appointment['id']} on {_spoken(appointment['appointment_date'])} has been cancelled.",
@@ -732,6 +874,7 @@ def complete_appointment(
         )
     conn.commit()
     conn.close()
+    _record_change(BOOKING_ENTITIES + ["vehicles"], row["customer_id"])
     return (True, f"Appointment {row['id']} marked as completed.")
 
 
@@ -824,9 +967,13 @@ def search_appointments(
             continue
         if customer_name and not _name_matches(customer_name, row["customer_name"]):
             continue
-        if mobile_number and _digits(mobile_number) not in _digits(row["mobile_number"]):
+        # A filter with nothing usable in it (e.g. a mobile search without
+        # digits) matches nothing, not everything.
+        if mobile_number and (not _digits(mobile_number) or _digits(mobile_number) not in _digits(row["mobile_number"])):
             continue
-        if registration_number and _alnum(registration_number) not in _alnum(row["registration_number"]):
+        if registration_number and (
+            not _alnum(registration_number) or _alnum(registration_number) not in _alnum(row["registration_number"])
+        ):
             continue
         if model and _alnum(model) not in _alnum(row["model"]):
             continue
@@ -851,6 +998,7 @@ def log_call(
     vehicle_id: int | None = None,
     callback_date: str | None = None,
     notes: str | None = None,
+    actor: str = "agent",
 ) -> tuple[bool, str]:
     outcome = (outcome or "").strip().lower()
     if outcome not in CALL_OUTCOMES:
@@ -863,17 +1011,844 @@ def log_call(
     )
     conn.commit()
     conn.close()
+    _record_change(["calls", "customers", "stats"], customer_id)
+    if actor == "agent" and outcome in OUTCOME_NOTIFICATIONS:
+        level, title = OUTCOME_NOTIFICATIONS[outcome]
+        detail = f"Call back on {_human_day(normalize_date(callback_date) or callback_date)}" if callback_date else (notes or "")
+        notify(f"call_{outcome}", level, f"{title} · {_customer_name(customer_id)}", detail, customer_id)
     return (True, f"Call outcome '{outcome}' saved.")
 
 
-def get_call_logs() -> list:
+def get_call_logs(
+    customer_id: int | None = None, limit: int | None = None, since_utc: str | None = None
+) -> list:
+    """Call log, newest first. `since_utc` ('YYYY-MM-DD HH:MM:SS') and `limit`
+    keep the big table's reads small."""
+    conn = _connect()
+    cursor = conn.cursor()
+    clauses, params = [], []
+    if customer_id:
+        clauses.append("l.customer_id = ?")
+        params.append(customer_id)
+    if since_utc:
+        clauses.append("l.created_at >= ?")
+        params.append(since_utc)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    cursor.execute(
+        f"""
+    SELECT l.*, c.name AS customer_name, c.mobile_number, v.registration_number, v.model
+    FROM call_logs l
+    JOIN customers c ON c.id = l.customer_id
+    LEFT JOIN vehicles v ON v.id = l.vehicle_id
+    {where}
+    ORDER BY l.created_at DESC, l.id DESC
+    {"LIMIT " + str(int(limit)) if limit else ""}
+    """,
+        tuple(params),
+    )
+    rows = [_plain(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def count_call_logs() -> int:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT count(*) AS n FROM call_logs")
+    n = cursor.fetchone()["n"]
+    conn.close()
+    return n
+
+
+# ---------------------------------------------------------------------------
+# CRM: customers, bikes and bookings managed by showroom staff
+# ---------------------------------------------------------------------------
+def _clean_mobile(mobile_number: str | None) -> str:
+    return re.sub(r"[^0-9+]", "", (mobile_number or "").strip())
+
+
+def list_customers(query: str | None = None) -> list:
+    """Every customer with their bikes, next booking and last call (newest first)."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM customers ORDER BY created_at DESC, id DESC")
+    customers = [_plain(r) for r in cursor.fetchall()]
+    cursor.execute("SELECT * FROM vehicles ORDER BY next_service_date")
+    vehicles = [_plain(r) for r in cursor.fetchall()]
+    cursor.execute(
+        "SELECT * FROM service_appointments WHERE status = 'CONFIRMED' AND appointment_date >= ? "
+        "ORDER BY appointment_date",
+        (today().isoformat(),),
+    )
+    upcoming = [_plain(r) for r in cursor.fetchall()]
+    # Only each customer's latest call (not the whole call history).
+    cursor.execute(
+        "SELECT * FROM call_logs WHERE id IN (SELECT max(id) FROM call_logs GROUP BY customer_id)"
+    )
+    last_calls = {r["customer_id"]: r for r in (_plain(row) for row in cursor.fetchall())}
+    conn.close()
+
+    bikes_by_customer: dict[int, list] = {}
+    for v in vehicles:
+        bikes_by_customer.setdefault(v["customer_id"], []).append(v)
+    next_booking: dict[int, dict] = {}
+    for a in upcoming:
+        next_booking.setdefault(a["customer_id"], a)
+
+    results = []
+    for customer in customers:
+        cid = customer["id"]
+        customer["vehicles"] = bikes_by_customer.get(cid, [])
+        customer["next_appointment"] = next_booking.get(cid)
+        customer["last_call"] = last_calls.get(cid)
+        if query:
+            haystack = " ".join(
+                [customer["name"], customer["mobile_number"]]
+                + [f"{v['registration_number']} {v['model']}" for v in customer["vehicles"]]
+            )
+            if not (
+                _name_matches(query, customer["name"])
+                or _alnum(query) in _alnum(haystack)
+                or (_digits(query) and _digits(query) in _digits(customer["mobile_number"]))
+            ):
+                continue
+        results.append(customer)
+    return results
+
+
+def get_customer_detail(customer_id: int) -> dict | None:
+    """A customer with bikes, every booking (with its state) and call history."""
+    customer = get_customer(customer_id)
+    if not customer:
+        return None
+    customer["appointments"] = [
+        {**a, "state": appointment_state(a)}
+        for a in sorted(
+            get_appointments(customer_id, include_cancelled=True),
+            key=lambda a: a["appointment_date"],
+            reverse=True,
+        )
+    ]
+    customer["calls"] = get_call_logs(customer_id)
+    return customer
+
+
+def create_customer(name: str, mobile_number: str) -> tuple[bool, str, int | None]:
+    name, mobile_number = (name or "").strip(), _clean_mobile(mobile_number)
+    if not name or len(_digits(mobile_number)) < 10:
+        return (False, "A name and a 10-digit mobile number are required.", None)
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM customers WHERE mobile_number = ?", (mobile_number,))
+    if cursor.fetchone():
+        conn.close()
+        return (False, f"A customer with mobile {mobile_number} already exists.", None)
+    cursor.execute("INSERT INTO customers (name, mobile_number) VALUES (?, ?)", (name, mobile_number))
+    customer_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    _record_change(["customers", "stats"], customer_id)
+    return (True, f"Customer {name} added.", customer_id)
+
+
+def update_customer(
+    customer_id: int, name: str | None = None, mobile_number: str | None = None
+) -> tuple[bool, str]:
+    if not get_customer(customer_id):
+        return (False, "Customer not found.")
+    conn = _connect()
+    cursor = conn.cursor()
+    if name is not None:
+        if not name.strip():
+            conn.close()
+            return (False, "Name can't be empty.")
+        cursor.execute("UPDATE customers SET name = ? WHERE id = ?", (name.strip(), customer_id))
+    if mobile_number is not None:
+        mobile_number = _clean_mobile(mobile_number)
+        if len(_digits(mobile_number)) < 10:
+            conn.close()
+            return (False, "Enter a 10-digit mobile number.")
+        cursor.execute(
+            "SELECT id FROM customers WHERE mobile_number = ? AND id != ?", (mobile_number, customer_id)
+        )
+        if cursor.fetchone():
+            conn.close()
+            return (False, f"Another customer already uses {mobile_number}.")
+        cursor.execute("UPDATE customers SET mobile_number = ? WHERE id = ?", (mobile_number, customer_id))
+    conn.commit()
+    conn.close()
+    _record_change(CUSTOMER_ENTITIES, customer_id)
+    return (True, "Customer updated.")
+
+
+def delete_customer(customer_id: int) -> tuple[bool, str]:
+    """Delete a customer and everything recorded for them (bikes, bookings, calls)."""
+    if not get_customer(customer_id):
+        return (False, "Customer not found.")
+    conn = _connect()
+    cursor = conn.cursor()
+    for table in ("call_logs", "service_appointments", "vehicles"):
+        cursor.execute(f"DELETE FROM {table} WHERE customer_id = ?", (customer_id,))
+    cursor.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
+    conn.commit()
+    conn.close()
+    _record_change(CUSTOMER_ENTITIES, customer_id)
+    return (True, "Customer deleted.")
+
+
+def list_vehicles() -> list:
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute("""
-    SELECT l.*, c.name AS customer_name, c.mobile_number
-    FROM call_logs l JOIN customers c ON c.id = l.customer_id
-    ORDER BY l.created_at DESC
+    SELECT v.*, c.name AS customer_name, c.mobile_number
+    FROM vehicles v JOIN customers c ON c.id = v.customer_id
+    ORDER BY v.next_service_date
     """)
+    rows = [_plain(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+VEHICLE_FIELDS = (
+    "registration_number", "model", "purchase_date", "last_service_date",
+    "odometer_km", "next_service_date", "next_service_type",
+)
+
+
+def update_vehicle(vehicle_id: int, **changes) -> tuple[bool, str]:
+    changes = {k: v for k, v in changes.items() if k in VEHICLE_FIELDS and v is not None}
+    if not changes:
+        return (False, "Nothing to change.")
+    for key in ("purchase_date", "last_service_date", "next_service_date"):
+        if key in changes:
+            day = normalize_date(str(changes[key]))
+            if not day:
+                return (False, f"Invalid date for {key.replace('_', ' ')}.")
+            changes[key] = day
+    if "registration_number" in changes:
+        changes["registration_number"] = changes["registration_number"].strip().upper()
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM vehicles WHERE id = ?", (vehicle_id,))
+    if not cursor.fetchone():
+        conn.close()
+        return (False, "Bike not found.")
+    if "registration_number" in changes:
+        cursor.execute(
+            "SELECT id FROM vehicles WHERE registration_number = ? AND id != ?",
+            (changes["registration_number"], vehicle_id),
+        )
+        if cursor.fetchone():
+            conn.close()
+            return (False, f"Bike {changes['registration_number']} already exists.")
+    assignments = ", ".join(f"{key} = ?" for key in changes)
+    cursor.execute(f"UPDATE vehicles SET {assignments} WHERE id = ?", (*changes.values(), vehicle_id))
+    conn.commit()
+    conn.close()
+    _record_change(["vehicles", "customers", "due", "stats"])
+    return (True, "Bike updated.")
+
+
+def delete_vehicle(vehicle_id: int) -> tuple[bool, str]:
+    """Delete a bike with its bookings; its call logs are kept without the bike link."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM vehicles WHERE id = ?", (vehicle_id,))
+    if not cursor.fetchone():
+        conn.close()
+        return (False, "Bike not found.")
+    cursor.execute("DELETE FROM service_appointments WHERE vehicle_id = ?", (vehicle_id,))
+    cursor.execute("UPDATE call_logs SET vehicle_id = NULL WHERE vehicle_id = ?", (vehicle_id,))
+    cursor.execute("DELETE FROM vehicles WHERE id = ?", (vehicle_id,))
+    conn.commit()
+    conn.close()
+    _record_change(CUSTOMER_ENTITIES)
+    return (True, "Bike deleted.")
+
+
+def get_appointment(appointment_id: str) -> dict | None:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    SELECT a.*, c.name AS customer_name, c.mobile_number, v.registration_number, v.model
+    FROM service_appointments a
+    JOIN customers c ON c.id = a.customer_id
+    JOIN vehicles v ON v.id = a.vehicle_id
+    WHERE UPPER(a.id) = UPPER(?)
+    """,
+        ((appointment_id or "").strip(),),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    row = _plain(row)
+    row["state"] = appointment_state(row)
+    return row
+
+
+def _ist_day(timestamp: str) -> str:
+    """'YYYY-MM-DD HH:MM:SS' stored in UTC -> the showroom (IST) date."""
+    try:
+        moment = datetime.strptime(timestamp[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("UTC"))
+    except (TypeError, ValueError):
+        return (timestamp or "")[:10]
+    return moment.astimezone(SHOWROOM_TZ).date().isoformat()
+
+
+def _ist_day_start_utc(day: date) -> str:
+    """Midnight IST of `day`, as the UTC timestamp format stored in created_at."""
+    start = datetime.combine(day, datetime.min.time(), SHOWROOM_TZ).astimezone(ZoneInfo("UTC"))
+    return start.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_dashboard_stats() -> dict:
+    """Numbers and series for the CRM dashboard (dates in showroom time).
+
+    Reads only what it shows: counts are SQL aggregates, calls are limited to
+    the last 30 days, bookings to upcoming ones.
+    """
+    current = today()
+    day = current.isoformat()
+    month_start = current.replace(day=1).isoformat()
+    week_ago = (current - timedelta(days=6)).isoformat()
+    month_ago_day = current - timedelta(days=29)
+
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT count(*) AS n FROM customers")
+    customers = cursor.fetchone()["n"]
+    cursor.execute("SELECT count(*) AS n FROM vehicles")
+    vehicles = cursor.fetchone()["n"]
+    cursor.execute(
+        "SELECT count(*) AS n FROM service_appointments WHERE status = 'COMPLETED' AND appointment_date >= ?",
+        (month_start,),
+    )
+    completed_this_month = cursor.fetchone()["n"]
+    cursor.execute(
+        """
+    SELECT a.*, c.name AS customer_name, c.mobile_number, v.registration_number, v.model
+    FROM service_appointments a
+    JOIN customers c ON c.id = a.customer_id
+    JOIN vehicles v ON v.id = a.vehicle_id
+    WHERE a.status = 'CONFIRMED' AND a.appointment_date >= ?
+    ORDER BY a.appointment_date
+    """,
+        (day,),
+    )
+    upcoming = [_plain(r) for r in cursor.fetchall()]
+    conn.close()
+
+    calls_30 = get_call_logs(since_utc=_ist_day_start_utc(month_ago_day))
+    for call in calls_30:
+        call["day"] = _ist_day(call["created_at"])
+    due = get_due_services(within_days=7)
+    outcomes = {outcome: 0 for outcome in sorted(CALL_OUTCOMES)}
+    for call in calls_30:
+        outcomes[call["outcome"]] = outcomes.get(call["outcome"], 0) + 1
+    confirmed = outcomes.get("date_confirmed", 0)
+    upcoming_by_day: dict[str, int] = {}
+    for a in upcoming:
+        upcoming_by_day[a["appointment_date"]] = upcoming_by_day.get(a["appointment_date"], 0) + 1
+    calls_by_day: dict[str, list[int]] = {}
+    for c in calls_30:
+        totals = calls_by_day.setdefault(c["day"], [0, 0])
+        totals[0] += 1
+        totals[1] += c["outcome"] == "date_confirmed"
+
+    return {
+        "today": day,
+        "totals": {
+            "customers": customers,
+            "vehicles": vehicles,
+            "due_this_week": len(due),
+            "overdue": sum(1 for d in due if d["next_service_date"] < day),
+            "upcoming_appointments": len(upcoming),
+            "appointments_today": upcoming_by_day.get(day, 0),
+            "completed_this_month": completed_this_month,
+            "calls_this_week": sum(1 for c in calls_30 if c["day"] >= week_ago),
+            "confirmation_rate": round(100 * confirmed / len(calls_30)) if calls_30 else 0,
+        },
+        "call_outcomes_30d": [{"outcome": k, "count": v} for k, v in outcomes.items()],
+        "appointments_next_14_days": [
+            {"date": d, "count": upcoming_by_day.get(d, 0)}
+            for d in ((current + timedelta(days=i)).isoformat() for i in range(14))
+        ],
+        "calls_last_14_days": [
+            {"date": d, "total": calls_by_day.get(d, [0, 0])[0], "confirmed": calls_by_day.get(d, [0, 0])[1]}
+            for d in ((current - timedelta(days=13 - i)).isoformat() for i in range(14))
+        ],
+        "todays_appointments": [a for a in upcoming if a["appointment_date"] == day],
+        "due_services": due[:8],
+        "recent_calls": calls_30[:6] if len(calls_30) >= 6 else get_call_logs(limit=6),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Service types (managed from the CRM)
+# ---------------------------------------------------------------------------
+SERVICE_TYPE_FIELDS = ("name", "description", "is_free", "interval_days", "interval_km", "price", "active")
+
+
+def _service_type_row(row) -> dict:
+    row = _plain(row)
+    row["is_free"] = bool(row["is_free"])
+    row["active"] = bool(row["active"])
+    return row
+
+
+def list_service_types(active_only: bool = False) -> list:
+    """Service types in schedule order, each with how many bikes have it due
+    next and how many bookings use it."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM service_types ORDER BY sort_order, id")
+    types = [_service_type_row(r) for r in cursor.fetchall()]
+    cursor.execute("SELECT next_service_type AS name, count(*) AS n FROM vehicles GROUP BY next_service_type")
+    bikes = {r["name"]: r["n"] for r in cursor.fetchall()}
+    cursor.execute("SELECT service_type AS name, count(*) AS n FROM service_appointments GROUP BY service_type")
+    bookings = {r["name"]: r["n"] for r in cursor.fetchall()}
+    conn.close()
+    for t in types:
+        t["bikes_due"] = bikes.get(t["name"], 0)
+        t["bookings"] = bookings.get(t["name"], 0)
+    return [t for t in types if t["active"]] if active_only else types
+
+
+def _clean_service_type(fields: dict) -> tuple[dict, str | None]:
+    clean = {k: v for k, v in fields.items() if k in SERVICE_TYPE_FIELDS}
+    if "name" in clean:
+        clean["name"] = re.sub(r"\s+", " ", (clean["name"] or "")).strip()
+        if not clean["name"]:
+            return clean, "Enter a name."
+        if len(clean["name"]) > 80:
+            return clean, "Keep the name under 80 characters."
+    for key in ("interval_days", "interval_km", "price"):
+        if key in clean and clean[key] is not None:
+            try:
+                clean[key] = int(clean[key])
+            except (TypeError, ValueError):
+                return clean, f"{key.replace('_', ' ').capitalize()} must be a whole number."
+            if clean[key] < 0 or (key == "interval_days" and clean[key] == 0):
+                return clean, f"{key.replace('_', ' ').capitalize()} must be more than 0."
+    for key in ("is_free", "active"):
+        if key in clean:
+            clean[key] = 1 if clean[key] else 0
+    if "description" in clean:
+        clean["description"] = (clean["description"] or "").strip() or None
+    return clean, None
+
+
+def create_service_type(**fields) -> tuple[bool, str, int | None]:
+    clean, error = _clean_service_type({"is_free": False, "active": True, **fields})
+    if error or "name" not in clean:
+        return (False, error or "Enter a name.", None)
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM service_types WHERE LOWER(name) = LOWER(?)", (clean["name"],))
+    if cursor.fetchone():
+        conn.close()
+        return (False, f"A service type called {clean['name']} already exists.", None)
+    cursor.execute("SELECT max(sort_order) AS n FROM service_types")
+    clean["sort_order"] = (cursor.fetchone()["n"] or 0) + 1
+    columns = ", ".join(clean)
+    cursor.execute(
+        f"INSERT INTO service_types ({columns}) VALUES ({', '.join('?' for _ in clean)})", tuple(clean.values())
+    )
+    type_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    _record_change(["service_types"])
+    return (True, f"Service type {clean['name']} added.", type_id)
+
+
+def update_service_type(type_id: int, **fields) -> tuple[bool, str]:
+    """Edit a service type. Renaming also renames it on bikes and bookings."""
+    clean, error = _clean_service_type(fields)
+    if error:
+        return (False, error)
+    if not clean:
+        return (False, "Nothing to change.")
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM service_types WHERE id = ?", (type_id,))
+    current = cursor.fetchone()
+    if not current:
+        conn.close()
+        return (False, "Service type not found.")
+    old_name = current["name"]
+    if "name" in clean and clean["name"] != old_name:
+        cursor.execute(
+            "SELECT id FROM service_types WHERE LOWER(name) = LOWER(?) AND id != ?", (clean["name"], type_id)
+        )
+        if cursor.fetchone():
+            conn.close()
+            return (False, f"A service type called {clean['name']} already exists.")
+        cursor.execute("UPDATE vehicles SET next_service_type = ? WHERE next_service_type = ?", (clean["name"], old_name))
+        cursor.execute("UPDATE service_appointments SET service_type = ? WHERE service_type = ?", (clean["name"], old_name))
+    assignments = ", ".join(f"{key} = ?" for key in clean)
+    cursor.execute(f"UPDATE service_types SET {assignments} WHERE id = ?", (*clean.values(), type_id))
+    conn.commit()
+    conn.close()
+    _record_change(["service_types", "vehicles", "appointments", "customers", "due"])
+    return (True, "Service type updated.")
+
+
+def delete_service_type(type_id: int) -> tuple[bool, str]:
+    """Delete a service type nothing uses yet; used ones can be deactivated."""
+    types = {t["id"]: t for t in list_service_types()}
+    service_type = types.get(type_id)
+    if not service_type:
+        return (False, "Service type not found.")
+    if service_type["bikes_due"] or service_type["bookings"]:
+        return (
+            False,
+            f"{service_type['name']} is used by {service_type['bikes_due']} bike(s) and "
+            f"{service_type['bookings']} booking(s). Deactivate it instead.",
+        )
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM service_types WHERE id = ?", (type_id,))
+    conn.commit()
+    conn.close()
+    _record_change(["service_types"])
+    return (True, f"Service type {service_type['name']} deleted.")
+
+
+def move_service_type(type_id: int, direction: str) -> tuple[bool, str]:
+    """Move a type up or down in the schedule order."""
+    order = [t["id"] for t in list_service_types()]
+    if type_id not in order:
+        return (False, "Service type not found.")
+    i = order.index(type_id)
+    j = i - 1 if direction == "up" else i + 1
+    if j < 0 or j >= len(order):
+        return (True, "Already at the edge.")
+    order[i], order[j] = order[j], order[i]
+    conn = _connect()
+    cursor = conn.cursor()
+    for position, tid in enumerate(order, start=1):
+        cursor.execute("UPDATE service_types SET sort_order = ? WHERE id = ?", (position, tid))
+    conn.commit()
+    conn.close()
+    _record_change(["service_types"])
+    return (True, "Order updated.")
+
+
+# ---------------------------------------------------------------------------
+# Staff logins (CRM dashboard)
+# ---------------------------------------------------------------------------
+STAFF_ROLES = {"admin", "staff"}
+
+
+def _public_user(row) -> dict:
+    user = _plain(row)
+    user.pop("password_hash", None)
+    return user
+
+
+def create_staff_user(
+    username: str, password_hash: str, full_name: str | None = None, role: str = "staff"
+) -> tuple[bool, str, int | None]:
+    username = (username or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9._-]{3,40}", username):
+        return (False, "Username: 3-40 letters, numbers, dots, dashes or underscores.", None)
+    if role not in STAFF_ROLES:
+        return (False, f"Role must be one of: {', '.join(sorted(STAFF_ROLES))}.", None)
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM staff_users WHERE username = ?", (username,))
+    if cursor.fetchone():
+        conn.close()
+        return (False, f"User {username} already exists.", None)
+    cursor.execute(
+        "INSERT INTO staff_users (username, full_name, password_hash, role) VALUES (?, ?, ?, ?)",
+        (username, (full_name or "").strip() or None, password_hash, role),
+    )
+    user_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return (True, f"User {username} created.", user_id)
+
+
+def get_staff_user(username: str | None = None, user_id: int | None = None, with_hash: bool = False) -> dict | None:
+    conn = _connect()
+    cursor = conn.cursor()
+    if user_id is not None:
+        cursor.execute("SELECT * FROM staff_users WHERE id = ?", (user_id,))
+    else:
+        cursor.execute("SELECT * FROM staff_users WHERE username = ?", ((username or "").strip().lower(),))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return _plain(row) if with_hash else _public_user(row)
+
+
+def list_staff_users() -> list:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM staff_users ORDER BY created_at, id")
+    rows = [_public_user(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def count_staff_users() -> int:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT count(*) AS n FROM staff_users")
+    n = cursor.fetchone()["n"]
+    conn.close()
+    return n
+
+
+def set_staff_password(user_id: int, password_hash: str) -> None:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE staff_users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_staff_user(user_id: int) -> tuple[bool, str]:
+    user = get_staff_user(user_id=user_id)
+    if not user:
+        return (False, "User not found.")
+    if user["role"] == "admin":
+        admins = [u for u in list_staff_users() if u["role"] == "admin"]
+        if len(admins) <= 1:
+            return (False, "Can't delete the last admin.")
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM staff_users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return (True, f"User {user['username']} deleted.")
+
+
+# ---------------------------------------------------------------------------
+# Live events (CRM WebSocket feed), notifications and voice-call tracking
+# ---------------------------------------------------------------------------
+# Entities the CRM refreshes when they change.
+BOOKING_ENTITIES = ["appointments", "customers", "due", "stats"]
+CUSTOMER_ENTITIES = ["customers", "vehicles", "appointments", "calls", "due", "stats"]
+
+# Agent call outcomes worth telling staff about: outcome -> (level, title).
+# date_confirmed is covered by the "Service booked" notification.
+OUTCOME_NOTIFICATIONS = {
+    "callback_requested": ("warning", "Call back requested"),
+    "not_interested": ("error", "Not interested"),
+    "already_serviced": ("info", "Already serviced elsewhere"),
+    "bike_sold": ("info", "Bike sold"),
+    "wrong_number": ("warning", "Wrong number"),
+    "no_answer": ("warning", "No answer"),
+}
+
+
+def emit_event(event_type: str, payload: dict, ref: str | None = None) -> int | None:
+    """Append an event for the CRM's live feed. Never raises: live updates
+    must not break a booking or a call."""
+    try:
+        conn = _connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO events (type, event_ref, payload) VALUES (?, ?, ?)",
+            (event_type, ref, json.dumps(payload, default=str)),
+        )
+        event_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return event_id
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not record event %s", event_type)
+        return None
+
+
+def _record_change(entities: list[str], customer_id: int | None = None) -> None:
+    emit_event("data.changed", {"entities": entities, "customer_id": customer_id})
+
+
+def notify(
+    kind: str,
+    level: str,
+    title: str,
+    body: str = "",
+    customer_id: int | None = None,
+    ref: str | None = None,
+) -> int | None:
+    """A staff notification (level: info, success, warning, error). With `ref`,
+    the same notification is only ever created once."""
+    if ref and event_ref_exists(ref):
+        return None
+    return emit_event(
+        "notification",
+        {"kind": kind, "level": level, "title": title, "body": body, "customer_id": customer_id},
+        ref=ref,
+    )
+
+
+def event_ref_exists(ref: str) -> bool:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM events WHERE event_ref = ?", (ref,))
+    found = cursor.fetchone() is not None
+    conn.close()
+    return found
+
+
+def _event_row(row) -> dict:
+    row = _plain(row)
+    return {"id": row["id"], "type": row["type"], "data": json.loads(row["payload"]), "at": row["created_at"]}
+
+
+def latest_event_id() -> int:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT max(id) AS n FROM events")
+    n = cursor.fetchone()["n"]
+    conn.close()
+    return n or 0
+
+
+def get_events_after(event_id: int, limit: int = 200) -> list:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?", (event_id, limit))
+    rows = [_event_row(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def recent_notifications(limit: int = 30) -> list:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM events WHERE type = 'notification' ORDER BY id DESC LIMIT ?", (limit,))
+    rows = [_event_row(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def prune_events(keep_days: int = 2, keep_notification_days: int = 60) -> None:
+    """Drop old feed rows (notifications are kept longer)."""
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM events WHERE type != 'notification' AND created_at < ?",
+        ((now_utc - timedelta(days=keep_days)).strftime("%Y-%m-%d %H:%M:%S"),),
+    )
+    cursor.execute(
+        "DELETE FROM events WHERE type = 'notification' AND created_at < ?",
+        ((now_utc - timedelta(days=keep_notification_days)).strftime("%Y-%m-%d %H:%M:%S"),),
+    )
+    conn.commit()
+    conn.close()
+
+
+MISSED_LOOKBACK_DAYS = 7
+
+
+def flag_missed_appointments() -> int:
+    """Notify once for every booking missed in the last MISSED_LOOKBACK_DAYS
+    (date passed, not serviced). Older misses aren't notified, so a first run
+    on an existing database doesn't flood the bell."""
+    created = 0
+    window_start = (today() - timedelta(days=MISSED_LOOKBACK_DAYS)).isoformat()
+    for appointment in get_all_appointments():
+        if (
+            appointment["status"] == "CONFIRMED"
+            and window_start <= appointment["appointment_date"] < today().isoformat()
+        ):
+            if notify(
+                "booking_missed", "warning",
+                f"Missed booking · {appointment['customer_name']}",
+                f"{appointment['model']} was booked for {_human_day(appointment['appointment_date'])} and not marked serviced.",
+                appointment["customer_id"], ref=f"missed:{appointment['id']}",
+            ):
+                created += 1
+    return created
+
+
+def _customer_name(customer_id: int) -> str:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM customers WHERE id = ?", (customer_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row["name"] if row else f"Customer {customer_id}"
+
+
+def _human_day(day: str | None) -> str:
+    """'2026-10-23' -> 'Fri, 23 Oct'."""
+    try:
+        return date.fromisoformat(str(day)[:10]).strftime("%a, %d %b").replace(" 0", " ")
+    except (TypeError, ValueError):
+        return str(day or "")
+
+
+def _utc_now() -> str:
+    return datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def start_voice_call(customer_id: int, customer_name: str, started_by: str | None) -> int:
+    """Record that the voice agent is now on a call (shown live in the CRM)."""
+    started_at = _utc_now()
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO voice_calls (customer_id, customer_name, started_by, started_at) VALUES (?, ?, ?, ?)",
+        (customer_id, customer_name, started_by, started_at),
+    )
+    call_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    emit_event(
+        "call.started",
+        {"call_id": call_id, "customer_id": customer_id, "customer_name": customer_name,
+         "started_by": started_by, "started_at": started_at},
+    )
+    return call_id
+
+
+def end_voice_call(
+    call_id: int, outcome: str | None, service_date: str | None = None, service_type: str | None = None
+) -> None:
+    """Close a call. `service_date` / `service_type`: the visit agreed on the
+    call, shown in the CRM's end-of-call notice."""
+    ended_at = _utc_now()
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM voice_calls WHERE id = ?", (call_id,))
+    row = cursor.fetchone()
+    if not row or _plain(row)["ended_at"]:
+        conn.close()
+        return
+    row = _plain(row)
+    cursor.execute("UPDATE voice_calls SET ended_at = ?, outcome = ? WHERE id = ?", (ended_at, outcome, call_id))
+    conn.commit()
+    conn.close()
+    started = datetime.strptime(row["started_at"][:19], "%Y-%m-%d %H:%M:%S")
+    emit_event(
+        "call.ended",
+        {"call_id": call_id, "customer_id": row["customer_id"], "customer_name": row["customer_name"],
+         "started_by": row["started_by"], "started_at": row["started_at"], "ended_at": ended_at,
+         "duration": int((datetime.strptime(ended_at, "%Y-%m-%d %H:%M:%S") - started).total_seconds()),
+         "outcome": outcome, "service_date": service_date, "service_type": service_type},
+    )
+
+
+def active_voice_calls(max_age_hours: int = 2) -> list:
+    """Calls in progress (open rows younger than `max_age_hours`, so a crashed
+    bot can't leave a call "live" forever)."""
+    since = (datetime.now(ZoneInfo("UTC")) - timedelta(hours=max_age_hours)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM voice_calls WHERE ended_at IS NULL AND started_at >= ? ORDER BY started_at",
+        (since,),
+    )
     rows = [_plain(r) for r in cursor.fetchall()]
     conn.close()
     return rows

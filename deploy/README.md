@@ -86,23 +86,25 @@ Then:
 - **Update the code later:** repeat the copy step and run `vm-setup.sh` again.
   The database and `.env` are kept.
 
-## 3. Frontend on GoDaddy
+## 3. CRM frontend on GoDaddy
 
-Every request from the frontend goes to `https://api.YOURDOMAIN.com/api/...`
-with the header `X-API-Key: <API_KEY>`, for example:
+The CRM (`../frontend`, Next.js + shadcn/ui) is a static site.
+`npm run build` writes `out/`. Full steps are in `frontend/README.md`. In short:
 
-```js
-fetch("https://api.YOURDOMAIN.com/api/due-services?days=7", {
-  headers: { "X-API-Key": API_KEY },
-});
-```
+1. `npm run build`. It points at `https://backend.arulmotors.com` via `.env.production`.
+2. Create the `crm.arulmotors.com` subdomain in cPanel, upload the contents of
+   `out/` to its folder, and turn on AutoSSL. In Cloudflare, point `crm` at
+   the GoDaddy hosting IP.
+3. On the VM, set `CORS_ORIGINS=https://crm.arulmotors.com` in
+   `/opt/arul-motors/.env` and run `sudo systemctl restart arul-api`.
+4. Create the first login (once):
+   ```bash
+   cd /opt/arul-motors && sudo -u arul .venv/bin/python api.py create-user admin --role admin --name "Your Name"
+   ```
 
-The API only accepts browser requests from the addresses in `CORS_ORIGINS`
-(set by `vm-setup.sh`). If the site also opens on `www.`, add that address as
-well, comma-separated, then run `sudo systemctl restart arul-api`.
-
-For test calls, link to `https://voice.YOURDOMAIN.com/client`. It asks for the
-voice page password.
+Staff sign in with their own accounts (Settings → Team). Calls started from
+the CRM go through the API (`/api/voice/offer`), so the voice page password
+is only for the separate test page at `https://voice.YOURDOMAIN.com/client`.
 
 ## Backups and restore
 
@@ -117,11 +119,9 @@ voice page password.
 
 - **Voice page:** it is behind Caddy's basic auth. Without it, anyone could
   start calls and run up Gemini charges.
-- **API:** it requires `API_KEY` and only allows `CORS_ORIGINS` from browsers.
-  - **Watch-out:** a key inside frontend JavaScript is visible to anyone who
-    opens the page's source. It keeps casual visitors and bots out, but it is
-    not a login. Before real customer data goes live, add staff login (or
-    keep the dashboard on a password-protected page).
+- **API:** it requires a staff login (signed tokens, 12 hours) and only
+  allows `CORS_ORIGINS` from browsers. `API_KEY` remains for scripts only;
+  never put it in frontend code.
 - **Vertex AI:** the VM's service account has only `roles/aiplatform.user`.
   No keys exist to leak.
 - The database never leaves the VM.

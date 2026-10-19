@@ -31,10 +31,12 @@ fi
 # the code on first start and is never overwritten by this script.
 id arul >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin arul
 mkdir -p "$APP"
-cp "$SRC/bot.py" "$SRC/database.py" "$SRC/api.py" "$SRC/requirements.txt" "$APP/"
+cp "$SRC/bot.py" "$SRC/database.py" "$SRC/api.py" "$SRC/auth.py" "$SRC/requirements.txt" "$APP/"
 if [ ! -f "$APP/.env" ]; then
   cat > "$APP/.env" <<ENV
-# Dashboard API key: the frontend sends it in the X-API-Key header.
+# Signs CRM staff logins. Changing it signs everyone out.
+AUTH_SECRET=$(openssl rand -hex 32)
+# Optional key for scripts (X-API-Key header). The CRM uses staff logins instead.
 API_KEY=$(openssl rand -hex 24)
 # Frontend site(s) allowed to call the API from the browser.
 CORS_ORIGINS=$FRONTEND_URL
@@ -44,6 +46,11 @@ BOT_URL=https://$VOICE_DOMAIN
 SEED_DEMO=0
 ENV
   echo ">> Created $APP/.env with a new API_KEY (sudo cat $APP/.env to see it)"
+fi
+# Servers installed before staff logins existed: add the signing secret once.
+if ! grep -q '^AUTH_SECRET=' "$APP/.env"; then
+  echo "AUTH_SECRET=$(openssl rand -hex 32)" >> "$APP/.env"
+  echo ">> Added AUTH_SECRET to $APP/.env"
 fi
 chmod 600 "$APP/.env"
 chown -R arul:arul "$APP"
@@ -72,5 +79,7 @@ systemctl reload caddy || systemctl restart caddy
 echo
 echo "Done."
 echo "  Voice page: https://$VOICE_DOMAIN/client"
-echo "  API:        https://$API_DOMAIN/api/due-services  (header X-API-Key)"
+echo "  API:        https://$API_DOMAIN/api/health"
+echo "  CRM login:  create the first admin (once):"
+echo "              cd $APP && sudo -u arul .venv/bin/python api.py create-user admin --role admin --name \"Your Name\""
 echo "  Logs:       journalctl -u arul-voice -f   /   journalctl -u arul-api -f"

@@ -662,89 +662,116 @@ accounts are free.
 
 ---
 
-## Lesson 6: Disks, snapshots, restore
+## Lesson 6: Disks, snapshots, restore (the real database backup)
 
 **AWS equivalent:** EBS snapshots + Data Lifecycle Manager + "create volume from snapshot".
 
 ### Concept
 
-- A **snapshot** is a point-in-time copy of a disk. Snapshots are
-  **incremental**: only changed blocks are stored, so daily snapshots are
-  cheap. They can be taken while the VM runs (crash-consistent, like
-  pulling the power plug; fine for SQLite in WAL mode).
-- **Storage location:** keep snapshots in `asia-south1` (regional), or
-  multi-regional for extra safety.
-- **Snapshot schedule:** an automatic policy (e.g. daily at 02:00 IST, keep
-  14 days) attached to a disk. This is the real server's database backup.
+- A **snapshot** is a point-in-time copy of a disk.
+  - **Incremental:** only changed blocks are stored, so daily snapshots are cheap.
+  - It can be taken while the VM runs (crash-consistent, which is fine for
+    SQLite in WAL mode) or while it's stopped (fully consistent).
+- Snapshots **outlive the VM**. If the VM or its disk is deleted, the
+  snapshots remain.
+- **Snapshot schedule:** an automatic policy (e.g. daily, keep 14 days)
+  attached to a disk.
+  - A disk can have **one** snapshot schedule.
+  - Google may create **`default-schedule-1`** automatically for new disks.
+    Check it before making your own.
 - **Restore options:**
-  1. create a new disk from a snapshot and attach it to read files;
+  1. create a new disk from a snapshot, attach it and copy files back (e.g.
+     the database);
   2. create a whole new VM whose boot disk comes from the snapshot.
-- Snapshots survive **VM deletion**, which makes them the safety net before
-  risky changes.
+- **What must be protected on the real server:**
+  `/opt/arul-motors/arul_motors.db` (+ `-wal` / `-shm`), which holds every
+  customer, booking and call log, and `/opt/arul-motors/.env` (`API_KEY`).
 
-### Part A: mark the disk, take a snapshot
+### Part A: check the existing schedule
 
-On the VM:
+**Console:** ☰ → **Compute Engine → Snapshots** → tab **Snapshot schedules**
+→ click **`default-schedule-1`**. Note:
+- **Frequency / start time** (times are shown in UTC; IST = UTC + 5:30)
+- **Auto-delete snapshots after** (retention)
+- **Region / storage location**
+- **In use by:** is the disk `arulmotors` listed?
+
+Also: **Compute Engine → Disks → `arulmotors`** → *Snapshot schedule* field.
+
 ```bash
-echo "snapshot test $(date)" > ~/marker.txt && cat ~/marker.txt
+gcloud compute resource-policies describe default-schedule-1 --region=asia-south1
+gcloud compute disks describe arulmotors --zone=asia-south1-c --format="value(resourcePolicies)"
 ```
 
-**Console:** Compute Engine → **Disks** → `arulmotors` → **Create snapshot**:
-name `arulmotors-snap-1`, location **Regional → asia-south1** → Create.
+**Decide:**
+- It's attached, runs daily and keeps ≥ 7 days → **keep it** (skip Part D).
+- Otherwise → create `arul-daily-backup` (Part D). If `default-schedule-1`
+  is attached, detach it first (one schedule per disk).
 
-**gcloud:**
+### Part B: take a manual snapshot (works with the VM stopped or running)
+
+**Console:** Compute Engine → **Disks** → `arulmotors` → **Create snapshot**:
+- name `arulmotors-snap-1`
+- location **Regional → asia-south1**
+- Create
+
 ```bash
 gcloud compute snapshots create arulmotors-snap-1 \
   --source-disk=arulmotors --source-disk-zone=asia-south1-c --storage-location=asia-south1
 gcloud compute snapshots list
 ```
 
-### Part B: "lose" the file, then restore it from the snapshot
+### Part C: restore test, i.e. prove the database can be recovered
 
-On the VM: `rm ~/marker.txt`
+1. **Start the VM** (it must be running to attach and read a disk).
+2. Create a disk from the snapshot and attach it as a second disk:
+   ```bash
+   gcloud compute disks create restore-test --zone=asia-south1-c --source-snapshot=arulmotors-snap-1
+   gcloud compute instances attach-disk arulmotors --zone=asia-south1-c --disk=restore-test
+   ```
+   (Console: Disks → **Create disk** → Source **Snapshot**; then VM → Edit →
+   **Attach existing disk**.)
+3. On the VM (SSH), mount it read-only and read the database **copy**:
+   ```bash
+   lsblk                                              # new disk, e.g. sdb with partition sdb1
+   sudo mkdir -p /mnt/restore && sudo mount -o ro /dev/sdb1 /mnt/restore
+   ls -l /mnt/restore/opt/arul-motors/                # arul_motors.db (+ -wal/-shm), .env
+   sudo mkdir -p /tmp/restore && sudo cp /mnt/restore/opt/arul-motors/arul_motors.db* /tmp/restore/
+   sudo sqlite3 /tmp/restore/arul_motors.db "SELECT count(*) FROM customers; SELECT id, appointment_date, status FROM service_appointments;"
+   ```
+   - Copy all `arul_motors.db*` files together: recent writes can still be
+     in the `-wal` file.
+   - The counts should match the live database:
+     `sudo sqlite3 /opt/arul-motors/arul_motors.db "SELECT count(*) FROM customers;"`.
+4. **How a real recovery would work** (don't run this now):
+   ```bash
+   sudo systemctl stop arul-voice arul-api
+   sudo cp /tmp/restore/arul_motors.db* /opt/arul-motors/ && sudo chown arul:arul /opt/arul-motors/arul_motors.db*
+   sudo systemctl start arul-voice arul-api
+   ```
+5. Clean up the test disk:
+   ```bash
+   sudo umount /mnt/restore && sudo rm -rf /tmp/restore          # on the VM
+   gcloud compute instances detach-disk arulmotors --zone=asia-south1-c --disk=restore-test
+   gcloud compute disks delete restore-test --zone=asia-south1-c --quiet
+   ```
 
-From the Mac (or console: Disks → **Create disk** → Source: snapshot):
-```bash
-gcloud compute disks create restore-test --zone=asia-south1-c --source-snapshot=arulmotors-snap-1
-gcloud compute instances attach-disk arulmotors --zone=asia-south1-c --disk=restore-test
-```
-
-On the VM:
-```bash
-lsblk                                   # the new disk appears, e.g. sdb with partition sdb1
-sudo mkdir -p /mnt/restore
-sudo mount -o ro /dev/sdb1 /mnt/restore
-cat /mnt/restore/home/arulmotorsnazareth/marker.txt   # the "lost" file is back
-cp /mnt/restore/home/arulmotorsnazareth/marker.txt ~/
-sudo umount /mnt/restore
-```
-
-For the real server, the same method recovers
-`/opt/arul-motors/arul_motors.db`.
-
-Detach and delete the test disk:
-```bash
-gcloud compute instances detach-disk arulmotors --zone=asia-south1-c --disk=restore-test
-gcloud compute disks delete restore-test --zone=asia-south1-c --quiet
-```
-
-### Part C: automatic daily snapshots
+### Part D: daily automatic snapshots (only if Part A says so)
 
 **Console:**
-1. Compute Engine → **Snapshots → Snapshot schedules** → **Create**:
+1. Snapshots → **Snapshot schedules → Create**:
    - name `arul-daily-backup`, region **asia-south1**
-   - frequency **Daily**, start time **20:30 UTC** (= 02:00 IST)
-   - auto-delete after **14 days** → Create
-2. **Disks** → `arulmotors` → **Edit** → *Snapshot schedule:* `arul-daily-backup` → Save.
+   - **Daily**, start **20:30 UTC** (= 02:00 IST)
+   - auto-delete after **14 days**
+2. Disks → `arulmotors` → **Edit** → Snapshot schedule `arul-daily-backup` → Save.
 
-**gcloud** (the same commands `gcp-create-vm.sh` uses):
 ```bash
+# if default-schedule-1 is attached and you're replacing it:
+gcloud compute disks remove-resource-policies arulmotors --zone=asia-south1-c --resource-policies=default-schedule-1
 gcloud compute resource-policies create snapshot-schedule arul-daily-backup \
   --region=asia-south1 --daily-schedule --start-time=20:30 \
   --max-retention-days=14 --storage-location=asia-south1
-gcloud compute disks add-resource-policies arulmotors --zone=asia-south1-c \
-  --resource-policies=arul-daily-backup
-gcloud compute resource-policies list
+gcloud compute disks add-resource-policies arulmotors --zone=asia-south1-c --resource-policies=arul-daily-backup
 ```
 
 **Restore a whole VM instead:** Create instance → Boot disk → **Change →
@@ -752,33 +779,36 @@ Snapshots** → pick one. Useful if the VM itself is broken.
 
 ### Check
 
-- `gcloud compute snapshots list` shows `arulmotors-snap-1`; the next day,
-  automatic ones appear too.
-- `gcloud compute disks describe arulmotors --zone=asia-south1-c --format="value(resourcePolicies)"` shows the schedule.
+- `gcloud compute disks describe arulmotors --zone=asia-south1-c --format="value(resourcePolicies)"` → one schedule attached.
+- The next day, `gcloud compute snapshots list` shows an automatic snapshot.
+- Restore test: the counts from the restored copy match the live database.
 
 ### Clean up
 
-- Delete the manual test snapshot when it's no longer needed:
-  `gcloud compute snapshots delete arulmotors-snap-1 --quiet`
-- **Keep the schedule** if this VM becomes the real server.
+- Delete the test disk (Part C, step 5).
+- Delete `arulmotors-snap-1` when no longer needed (the schedule makes its
+  own): `gcloud compute snapshots delete arulmotors-snap-1 --quiet`.
 
 ### Cost
 
-About ₹2–5 per GB-month of stored snapshot data. With 2–3 GB used and
-small daily changes, that's tens of rupees a month.
+About ₹2–5 per GB-month of stored snapshot data. With 3–4 GB used and small
+daily changes, that's tens of rupees a month. The test disk costs a few
+paise while it exists.
 
 ### Takeaways
 
-- Snapshots are **incremental**, can be taken **live**, and **outlive the VM**.
-- **Restore = new disk (or VM) from a snapshot.**
-- A **schedule** turns snapshots into automatic backups. Set it on the real
-  server's disk.
+- **Backups only count once a restore has been tested.** You restored the
+  real database.
+- Snapshots are incremental, can be taken live, and outlive the VM.
+- One schedule per disk. Check Google's `default-schedule-1` before adding your own.
+- Copy `arul_motors.db` **with** its `-wal`/`-shm` files.
 
 ### What happened (fill in)
 
 - Date:
-- File recovered from snapshot:
-- Schedule attached:
+- `default-schedule-1` settings / attached to `arulmotors`:
+- Restore test (customers / appointments counted):
+- Final schedule:
 
 ---
 

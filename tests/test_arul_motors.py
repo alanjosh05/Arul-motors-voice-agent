@@ -26,6 +26,12 @@ def no_mysql_by_default(monkeypatch):
     """A MYSQL_HOST in the developer's environment must not leak into tests."""
     for name in ("MYSQL_HOST", "MYSQL_SSL", "MYSQL_SSL_CA", "SEED_DEMO"):
         monkeypatch.delenv(name, raising=False)
+    # The API's result cache is keyed by data version (latest event id + date);
+    # each test has a fresh database whose ids restart, so start it empty.
+    import sys
+
+    if "api" in sys.modules:
+        sys.modules["api"].cache.clear()
 
 
 @pytest.fixture(params=BACKENDS)
@@ -296,6 +302,7 @@ def test_bot_module_imports(db, monkeypatch, tmp_path):
     assert names == {
         "get_current_datetime",
         "search_service_bookings",
+        "get_service_types",
         "create_service_appointment",
         "get_service_appointments",
         "update_service_appointment",
@@ -309,7 +316,7 @@ def test_bot_module_imports(db, monkeypatch, tmp_path):
 
     prompt = bot.build_system_instruction(db.get_customer(1))
     assert "Karthik Raja" in prompt and "TN 09 AB 1234" in prompt
-    assert "Yamaha" in prompt and "Nazareth" in prompt and "TANGLISH" in prompt
+    assert "Yamaha" in prompt and "Nazareth" in prompt and "spoken tamil" in prompt.lower()
     assert "Thoothukudi" in prompt
     # The date is not baked into the prompt: the agent must use the datetime tool.
     assert db.today().isoformat() not in prompt
@@ -341,6 +348,9 @@ def test_llm_uses_vertex_with_adc(db, monkeypatch):
     assert llm._project_id == bot.GOOGLE_CLOUD_PROJECT == "project-2c317546-b2c6-4a7a-8d4"
     assert llm._location == bot.GOOGLE_CLOUD_LOCATION == "us-central1"
     assert llm._settings.model == bot.GEMINI_MODEL == "gemini-3.8-live"
+    # Tamil speech (not Pipecat's en-US default) and no tight reply cap.
+    assert llm._settings.language == bot.GEMINI_LANGUAGE == "ta-IN"
+    assert llm._settings.max_tokens >= 2048
     # Vertex rejects a custom thinking level for this project.
     assert not llm._settings.thinking
 
@@ -421,25 +431,44 @@ async def test_voice_search_privacy(db):
     own = await search()
     assert "Ray ZR 125" in own and "completed" in own and "this customer" in own
 
-    # Her own bike by model or partial registration.
-    assert "First free service" in await search(model="ray")
-    assert "Found 1" in await search(registration_number="5678")
+    # Her own bike by model or partial registration (one free-text query).
+    assert "First free service" in await search(query="ray")
+    assert "Found 1" in await search(query="5678")
+    assert "completed" in await search(query="ray", state="completed")
 
     # Another customer by name only: hidden.
-    hidden = await search(customer_name="Suresh")
+    hidden = await search(query="Suresh")
     assert "hidden" in hidden and "R15" not in hidden
     # ...but shown with the full registration number.
-    shown = await search(registration_number="TN22EF9012")
+    shown = await search(query="TN22EF9012")
     assert "R15 V4" in shown and "customer Suresh Kumar" in shown
     # ...or the full mobile number, and the number itself is never echoed.
-    by_mobile = await search(mobile_number="9840012345")
+    by_mobile = await search(query="9840012345")
     assert "R15 V4" in by_mobile and "9840012345" not in by_mobile
 
-    assert "No matching" in await search(customer_name="Nobody")
+    assert "No matching" in await search(query="Nobody")
 
 
-def test_api_key_and_cors(db, monkeypatch):
-    """api.py needs X-API-Key once API_KEY is set, and allows the frontend's origin."""
+def _api_client(monkeypatch, *, admin=True):
+    """TestClient for api.py, signed in as a freshly created staff user."""
+    from fastapi.testclient import TestClient
+
+    import api
+    import auth
+    import database
+
+    monkeypatch.setenv("AUTH_SECRET", "test-secret")
+    role = "admin" if admin else "staff"
+    database.create_staff_user(role + "1", auth.hash_password("password123"), "Test " + role, role)
+    client = TestClient(api.app)
+    token = client.post("/api/auth/login", json={"username": role + "1", "password": "password123"}).json()["token"]
+    client.headers["Authorization"] = f"Bearer {token}"
+    return client
+
+
+def test_api_requires_login_api_key_and_cors(db, monkeypatch):
+    """Every API route needs a staff login (or X-API-Key for scripts); CORS
+    allows only the CRM frontend's origin."""
     import importlib
 
     from fastapi.testclient import TestClient
@@ -447,22 +476,123 @@ def test_api_key_and_cors(db, monkeypatch):
     import api
 
     client = TestClient(api.app)
-    assert client.get("/api/customers").status_code == 200  # no API_KEY: open (local)
+    assert client.get("/api/health").status_code == 200  # open
+    assert client.get("/api/customers").status_code == 401
 
     monkeypatch.setenv("API_KEY", "s3cret")
-    assert client.get("/api/customers").status_code == 401
     assert client.get("/api/customers", headers={"X-API-Key": "wrong"}).status_code == 401
     ok = client.get("/api/customers", headers={"X-API-Key": "s3cret"})
     assert ok.status_code == 200 and len(ok.json()) == 4
 
-    # CORS: only the GoDaddy frontend may call the API from a browser.
-    monkeypatch.setenv("CORS_ORIGINS", "https://arulmotors.example")
+    monkeypatch.setenv("CORS_ORIGINS", "https://crm.arulmotors.example")
     client = TestClient(importlib.reload(api).app)
-    preflight = {"Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "x-api-key"}
-    allowed = client.options("/api/customers", headers={"Origin": "https://arulmotors.example", **preflight})
-    assert allowed.headers.get("access-control-allow-origin") == "https://arulmotors.example"
+    preflight = {"Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "authorization"}
+    allowed = client.options("/api/customers", headers={"Origin": "https://crm.arulmotors.example", **preflight})
+    assert allowed.headers.get("access-control-allow-origin") == "https://crm.arulmotors.example"
     blocked = client.options("/api/customers", headers={"Origin": "https://evil.example", **preflight})
     assert "access-control-allow-origin" not in blocked.headers
+
+
+def test_staff_login_tokens_and_roles(db, monkeypatch):
+    import auth
+
+    hashed = auth.hash_password("password123")
+    assert auth.verify_password("password123", hashed) and not auth.verify_password("nope", hashed)
+    monkeypatch.setenv("AUTH_SECRET", "test-secret")
+    token = auth.create_token({"id": 1, "username": "a", "role": "admin"})
+    assert auth.read_token(token)["sub"] == 1
+    assert auth.read_token(token[:-2] + "xx") is None  # tampered
+    assert auth.read_token(auth.create_token({"id": 1, "username": "a", "role": "admin"}, ttl_secs=-1)) is None
+
+    admin = _api_client(monkeypatch)
+    assert admin.post("/api/auth/login", json={"username": "admin1", "password": "wrong"}).status_code == 401
+    assert admin.get("/api/auth/me").json()["role"] == "admin"
+    # Admins manage staff; staff can't.
+    created = admin.post("/api/staff", json={"username": "ravi", "password": "password123", "full_name": "Ravi"})
+    assert created.status_code == 201
+    assert admin.post("/api/staff", json={"username": "x", "password": "short"}).status_code == 400
+    staff = _api_client(monkeypatch, admin=False)
+    assert staff.get("/api/staff").status_code == 403
+    assert staff.post("/api/auth/password", json={"current_password": "password123", "new_password": "newpassword9"}).status_code == 200
+    assert staff.post("/api/auth/login", json={"username": "staff1", "password": "newpassword9"}).status_code == 200
+
+
+def test_crm_customers_vehicles_bookings_and_stats(db, monkeypatch):
+    client = _api_client(monkeypatch)
+
+    # Customers: list (with bikes), search, create, update, detail, delete.
+    customers = client.get("/api/customers").json()
+    assert len(customers) == 4 and all(c["vehicles"] for c in customers)
+    assert [c["name"] for c in client.get("/api/customers", params={"q": "fascino"}).json()] == ["Anitha Devi"]
+    new = client.post("/api/customers", json={"name": "Murugan", "mobile_number": "98765 11111"})
+    assert new.status_code == 201
+    cid = new.json()["id"]
+    assert client.post("/api/customers", json={"name": "Dup", "mobile_number": "9876511111"}).status_code == 400
+    assert client.patch(f"/api/customers/{cid}", json={"name": "Murugan S"}).status_code == 200
+
+    # Bikes: add to the new customer, edit, list.
+    sale = {
+        "name": "Murugan S", "mobile_number": "9876511111", "registration_number": "tn 69 zz 0001",
+        "model": "Yamaha MT-15", "next_service_date": days_ahead(20), "next_service_type": "First free service",
+    }
+    assert client.post("/api/vehicles", json=sale).status_code == 201
+    detail = client.get(f"/api/customers/{cid}").json()
+    vid = detail["vehicles"][0]["id"]
+    assert detail["vehicles"][0]["registration_number"] == "TN 69 ZZ 0001"
+    assert client.patch(f"/api/vehicles/{vid}", json={"odometer_km": 750}).status_code == 200
+    assert any(v["odometer_km"] == 750 for v in client.get("/api/vehicles").json())
+
+    # Bookings: create, reschedule, cancel; complete another.
+    booked = client.post("/api/appointments", json={"customer_id": cid, "appointment_date": days_ahead(3)})
+    assert booked.status_code == 201
+    aid = booked.json()["id"]
+    assert client.patch(f"/api/appointments/{aid}", json={"appointment_date": days_ahead(4)}).status_code == 200
+    assert client.get(f"/api/appointments/{aid}").json()["appointment_date"] == days_ahead(4)
+    assert client.post(f"/api/appointments/{aid}/cancel").status_code == 200
+    assert client.get(f"/api/appointments/{aid}").json()["state"] == "cancelled"
+    assert client.post("/api/appointments", json={"customer_id": cid, "appointment_date": "2000-01-01"}).status_code == 400
+    assert client.get("/api/appointments", params={"state": "cancelled"}).json()[0]["id"] == aid
+
+    # Staff-logged call + dashboard stats.
+    assert client.post("/api/calls/log", json={"customer_id": cid, "outcome": "date_confirmed"}).status_code == 201
+    assert client.post("/api/calls/log", json={"customer_id": cid, "outcome": "bogus"}).status_code == 400
+    stats = client.get("/api/stats").json()
+    assert stats["totals"]["customers"] == 5 and stats["totals"]["vehicles"] == 5
+    assert stats["totals"]["calls_this_week"] == 1 and stats["totals"]["confirmation_rate"] == 100
+    assert len(stats["appointments_next_14_days"]) == 14 and len(stats["calls_last_14_days"]) == 14
+    assert client.get(f"/api/customers/{cid}").json()["calls"][0]["outcome"] == "date_confirmed"
+
+    # Deleting removes the customer and everything recorded for them.
+    assert client.delete(f"/api/customers/{cid}").status_code == 200
+    assert client.get(f"/api/customers/{cid}").status_code == 404
+    assert len(client.get("/api/customers").json()) == 4
+
+
+def test_voice_relay_checks_customer_and_forwards(db, monkeypatch):
+    import api
+
+    client = _api_client(monkeypatch, admin=False)
+    sent = []
+
+    async def fake_relay(method, payload):
+        sent.append((method, payload))
+        return {"sdp": "answer", "type": "answer", "pc_id": "pc1"}
+
+    monkeypatch.setattr(api, "_relay_to_bot", fake_relay)
+    offer = {"sdp": "offer", "type": "offer", "requestData": {"customer_id": 2}}
+    assert client.post("/api/voice/offer", json=offer).json()["pc_id"] == "pc1"
+    assert sent[0] == (
+        "POST",
+        {"sdp": "offer", "type": "offer", "request_data": {"customer_id": 2, "started_by": "Test staff"}},
+    )
+    assert client.post("/api/voice/offer", json={"sdp": "o", "type": "offer"}).status_code == 400
+    assert client.post("/api/voice/offer", json={**offer, "requestData": {"customer_id": 999}}).status_code == 404
+    assert client.patch("/api/voice/offer", json={"pc_id": "pc1", "candidates": []}).status_code == 200
+    assert client.get("/api/voice/config").json()["ice_servers"][0]["urls"].startswith("stun:")
+    # Not signed in: no calls.
+    from fastapi.testclient import TestClient
+
+    assert TestClient(api.app).post("/api/voice/offer", json=offer).status_code == 401
 
 
 def test_sqlite_shared_by_two_processes(db):
@@ -470,3 +600,265 @@ def test_sqlite_shared_by_two_processes(db):
     conn = db._connect()
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     conn.close()
+
+
+def test_live_events_notifications_and_voice_calls(db):
+    """Writes feed the CRM's live stream; only the agent's actions notify staff."""
+    start = db.latest_event_id()
+    ok, _, aid = db.create_appointment(1, days_ahead(3))  # by the agent (default)
+    assert ok
+    events = db.get_events_after(start)
+    assert {"data.changed", "notification"} <= {e["type"] for e in events}
+    changed = next(e for e in events if e["type"] == "data.changed")["data"]
+    assert "appointments" in changed["entities"] and changed["customer_id"] == 1
+    booked = next(e for e in events if e["type"] == "notification")["data"]
+    assert booked["kind"] == "booking_created" and "Karthik Raja" in booked["title"]
+
+    # Staff edits refresh the CRM but don't notify.
+    mark = db.latest_event_id()
+    db.update_appointment(1, aid, new_date=days_ahead(4), actor="staff:ravi")
+    assert [e["type"] for e in db.get_events_after(mark)] == ["data.changed"]
+
+    # Agent call outcomes notify (except date_confirmed, covered by the booking).
+    mark = db.latest_event_id()
+    db.log_call(2, "callback_requested", callback_date=days_ahead(2))
+    db.log_call(2, "date_confirmed")
+    titles = [e["data"]["title"] for e in db.get_events_after(mark) if e["type"] == "notification"]
+    assert titles == ["Call back requested · Priya Lakshmi"]
+
+    # Missed bookings are flagged once.
+    conn = db._connect()
+    conn.execute("UPDATE service_appointments SET appointment_date = ? WHERE id = ?", (days_ahead(-1), aid))
+    conn.commit()
+    conn.close()
+    assert db.flag_missed_appointments() == 1
+    assert db.flag_missed_appointments() == 0
+    assert db.recent_notifications()[0]["data"]["kind"] == "booking_missed"
+
+    # Voice calls in progress.
+    call_id = db.start_voice_call(1, "Karthik Raja", "Ravi")
+    assert [c["id"] for c in db.active_voice_calls()] == [call_id]
+    db.end_voice_call(call_id, "date_confirmed")
+    assert db.active_voice_calls() == []
+    ended = [e for e in db.get_events_after(mark) if e["type"] == "call.ended"][-1]["data"]
+    assert ended["outcome"] == "date_confirmed" and ended["started_by"] == "Ravi"
+
+
+def test_live_websocket_requires_login_and_streams_events(db, monkeypatch):
+    import pytest as _pytest
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    import api
+    import auth
+    import database
+
+    monkeypatch.setenv("AUTH_SECRET", "test-secret")
+    monkeypatch.setattr(api, "EVENT_POLL_SECS", 0.05)
+    database.create_staff_user("ravi", auth.hash_password("password123"), "Ravi", "staff")
+    user = database.get_staff_user(username="ravi")
+    token = auth.create_token(user)
+
+    with TestClient(api.app) as client:  # runs the live event loop
+        with _pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/api/ws?token=bad") as ws:
+                ws.receive_text()
+        with client.websocket_connect(f"/api/ws?token={token}") as ws:
+            hello = ws.receive_json()
+            assert hello["type"] == "hello" and hello["data"]["user"]["username"] == "ravi"
+            assert "active_calls" in hello["data"] and "notifications" in hello["data"]
+            ws.send_text("ping")
+            assert ws.receive_json()["type"] == "pong"
+            database.start_voice_call(3, "Suresh Kumar", "Ravi")
+            message = ws.receive_json()
+            while message["type"] != "call.started":
+                message = ws.receive_json()
+            assert message["data"]["customer_name"] == "Suresh Kumar"
+        assert client.get(
+            "/api/voice/calls/active", headers={"Authorization": f"Bearer {token}"}
+        ).json()[0]["customer_name"] == "Suresh Kumar"
+        assert client.get("/api/notifications", headers={"Authorization": f"Bearer {token}"}).status_code == 200
+
+
+def test_service_types_crud_rename_and_delete_rules(db, monkeypatch):
+    names = [t["name"] for t in db.list_service_types()]
+    assert names[:4] == ["First free service", "Second free service", "Third free service", "Paid service"]
+    assert "General check-up" in names
+    first = db.list_service_types()[0]
+    assert first["is_free"] is True and first["interval_days"] == 30 and first["bikes_due"] == 1  # Karthik's FZ-S
+
+    client = _api_client(monkeypatch)
+    created = client.post("/api/service-types", json={"name": "Engine oil change", "interval_days": 90, "price": 650})
+    assert created.status_code == 201
+    tid = created.json()["id"]
+    assert client.post("/api/service-types", json={"name": "engine OIL change"}).status_code == 400  # duplicate
+    assert client.post("/api/service-types", json={"name": "Bad", "interval_days": 0}).status_code == 400
+
+    # Reorder, deactivate, clear the price.
+    assert client.post(f"/api/service-types/{tid}/move", params={"direction": "up"}).status_code == 200
+    order = [t["name"] for t in client.get("/api/service-types").json()]
+    assert order.index("Engine oil change") == order.index("General check-up") - 1
+    assert client.patch(f"/api/service-types/{tid}", json={"active": False, "price": None}).status_code == 200
+    assert "Engine oil change" not in [t["name"] for t in client.get("/api/service-types", params={"active_only": True}).json()]
+
+    # Renaming a used type renames it on bikes and bookings too.
+    paid = next(t for t in db.list_service_types() if t["name"] == "Paid service")
+    assert client.patch(f"/api/service-types/{paid['id']}", json={"name": "Periodic paid service"}).status_code == 200
+    assert db.get_customer(4)["vehicles"][0]["next_service_type"] == "Periodic paid service"
+
+    # Used types can't be deleted; unused ones can.
+    assert client.delete(f"/api/service-types/{paid['id']}").status_code == 400
+    assert client.delete(f"/api/service-types/{tid}").status_code == 200
+
+
+def test_api_caching_etag_gzip_throttle_and_limits(db, monkeypatch):
+    import api
+
+    client = _api_client(monkeypatch)
+
+    # Conditional GET: same data version -> 304, after a write -> fresh 200.
+    first = client.get("/api/customers")
+    etag = first.headers["etag"]
+    assert first.status_code == 200 and first.headers["cache-control"] == "private, no-cache"
+    assert client.get("/api/customers", headers={"If-None-Match": etag}).status_code == 304
+    client.post("/api/customers", json={"name": "Vel Murugan", "mobile_number": "9000000001"})
+    fresh = client.get("/api/customers", headers={"If-None-Match": etag})
+    assert fresh.status_code == 200 and len(fresh.json()) == 5  # versioned cache refreshed too
+    # No 304 without valid credentials (the route still answers 401).
+    from fastapi.testclient import TestClient
+    assert TestClient(api.app).get("/api/customers", headers={"If-None-Match": fresh.headers["etag"]}).status_code == 401
+
+    # Large JSON is gzipped.
+    assert client.get("/api/stats", headers={"Accept-Encoding": "gzip"}).headers.get("content-encoding") == "gzip"
+
+    # Call log is capped (newest first) with a separate total.
+    for _ in range(3):
+        client.post("/api/calls/log", json={"customer_id": 1, "outcome": "no_answer"})
+    assert len(client.get("/api/calls", params={"limit": 2}).json()) == 2
+    assert client.get("/api/calls/count").json()["total"] >= 3
+
+    # Too many failed sign-ins from one client -> 429, even with the right password next.
+    monkeypatch.setattr(api.LoginThrottle, "MAX_FAILURES", 3)
+    api.login_throttle._failures.clear()
+    anon = TestClient(api.app)
+    for _ in range(3):
+        assert anon.post("/api/auth/login", json={"username": "admin1", "password": "wrong"}).status_code == 401
+    assert anon.post("/api/auth/login", json={"username": "admin1", "password": "password123"}).status_code == 429
+    api.login_throttle._failures.clear()
+
+
+def test_database_indexes_exist(db):
+    conn = db._connect()
+    names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()}
+    conn.close()
+    assert {name for name, _, _ in db.INDEXES} <= names
+
+
+def test_prompt_service_info_guardrails_and_visit_date(db):
+    """The prompt names the due service with its CRM details (never a price)
+    and carries the strict-scope rules; a confirmed booking's date reaches the
+    call log and the CRM's end-of-call event."""
+    import asyncio
+    from types import SimpleNamespace
+
+    import bot
+
+    paid = next(t for t in db.list_service_types() if t["name"] == "Paid service")
+    db.update_service_type(paid["id"], description="Oil change, chain lube, brake check", price=1499)
+    prompt = bot.build_system_instruction(db.get_customer(4))  # Anitha: Paid service due
+    assert "Paid service: paid; Oil change, chain lube, brake check; next one due 120 days" in prompt
+    assert "1499" not in prompt and "1,499" not in prompt  # prices are never given to the agent
+    assert "STRICT SCOPE" in prompt and "Never reveal" in prompt and "end_call" in prompt
+    assert "-" not in prompt.split("CUSTOMER:")[1].split("SERVICE INFO")[0].split("due ")[1][:10]  # spoken dates
+
+    call = bot.ServiceCall(db.get_customer(1))
+    results = []
+
+    async def invoke(name, **arguments):
+        await getattr(call, name)(
+            SimpleNamespace(arguments=arguments, result_callback=lambda m, **_: _store(m))
+        )
+        return results[-1]
+
+    async def _store(message):
+        results.append(message)
+
+    async def run():
+        types = await invoke("get_service_types")
+        assert "First free service: free" in types and "₹" not in types and "1499" not in types
+        booked = await invoke("create_service_appointment", date=days_ahead(3))
+        assert "say this date" in booked
+        assert call.booked_date == days_ahead(3) and call.booked_service == "First free service"
+        logged = await invoke("log_call_outcome", outcome="date_confirmed")
+        assert "goodbye" in logged and "hangs up automatically" in logged
+        assert call.ending  # CallGuard hangs up after the goodbye
+
+    asyncio.run(run())
+    note = db.get_call_logs(1)[0]["notes"]
+    assert note.startswith("Coming on ") and "First free service" in note
+
+    call_id = db.start_voice_call(1, "Karthik Raja", "Ravi")
+    mark = db.latest_event_id()
+    db.end_voice_call(call_id, "date_confirmed", service_date=days_ahead(3), service_type="First free service")
+    ended = next(e for e in db.get_events_after(mark) if e["type"] == "call.ended")["data"]
+    assert ended["service_date"] == days_ahead(3) and ended["service_type"] == "First free service"
+
+
+async def test_call_guard_hangs_up(db, monkeypatch):
+    """CallGuard ends calls in code: after the goodbye, after a quiet wrap-up,
+    on silence and at the time limit."""
+    import asyncio
+
+    import bot
+    from pipecat.frames.frames import BotStoppedSpeakingFrame
+
+    def make(**state):
+        call = bot.ServiceCall(db.get_customer(1))
+        for k, v in state.items():
+            setattr(call, k, v)
+        guard = bot.CallGuard(call)
+        hung = []
+
+        async def fake_hang_up(reason):
+            guard._ended = True
+            guard.reason = reason
+            hung.append(reason)
+
+        monkeypatch.setattr(guard, "_hang_up", fake_hang_up)
+        return guard, hung
+
+    monkeypatch.setattr(bot, "WRAP_UP_IDLE_SECS", 0.5)
+    guard, hung = make(outcome_logged=True)
+    guard._last_activity -= 1
+    await asyncio.wait_for(guard._watchdog(), 5)
+    assert hung == ["wrap-up finished"]
+
+    monkeypatch.setattr(bot, "SILENCE_HANGUP_SECS", 0.5)
+    guard, hung = make()
+    guard._last_activity -= 1
+    await asyncio.wait_for(guard._watchdog(), 5)
+    assert hung == ["silence"]
+
+    monkeypatch.setattr(bot, "MAX_CALL_SECS", 0.5)
+    guard, hung = make()
+    guard._started -= 1
+    await asyncio.wait_for(guard._watchdog(), 5)
+    assert hung == ["time limit"]
+
+    # end_call while the goodbye is playing: waits until it has really finished
+    # (a short pause between phrases doesn't count).
+    monkeypatch.setattr(bot, "GOODBYE_SETTLE_SECS", 0.3)
+    guard, hung = make(ending=True)
+    guard._bot_speaking = True
+    monkeypatch.setattr(guard, "push_frame", lambda *a, **k: asyncio.sleep(0))
+    monkeypatch.setattr(bot.FrameProcessor, "process_frame", lambda self, frame, direction: asyncio.sleep(0))
+    monkeypatch.setattr(guard, "create_task", lambda coro, *a, **k: asyncio.ensure_future(coro))
+    guard._watch = object()  # don't start the watchdog from process_frame
+    from pipecat.frames.frames import BotStartedSpeakingFrame
+    await guard.process_frame(BotStoppedSpeakingFrame(), bot.FrameDirection.DOWNSTREAM)
+    await guard.process_frame(BotStartedSpeakingFrame(), bot.FrameDirection.DOWNSTREAM)  # still talking
+    await asyncio.sleep(0.5)
+    assert hung == []
+    await guard.process_frame(BotStoppedSpeakingFrame(), bot.FrameDirection.DOWNSTREAM)
+    await asyncio.sleep(0.5)
+    assert hung == ["goodbye finished"]
