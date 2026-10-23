@@ -1178,11 +1178,11 @@ starts EC2. In GCP it's built in: an **instance schedule** is a resource policy
 
 | | Time (IST) | Why |
 |---|---|---|
-| Start | **06:30** every day | The client's first calling window is 7–10 AM |
+| Start | **07:00** every day | The client's first calling window is 7–10 AM (the start can run ~15 min late) |
 | Stop | **21:30** every day | Last calling window ends 8 PM; workshop closes 7:30 PM |
 
-Off 9 h a night. Optional: keep it off all Sunday (weekly holiday) by starting
-only Monday–Saturday (`30 6 * * 1-6`).
+Off 9.5 h a night. Optional: keep it off all Sunday (weekly holiday) by starting
+only Monday–Saturday (`0 7 * * 1-6`).
 
 ### What happens at stop / start
 
@@ -1228,7 +1228,7 @@ gcloud projects add-iam-policy-binding project-2c317546-b2c6-4a7a-8d4 \
 
 1. **Compute Engine → VM instances → Instance schedules** tab → **Create schedule**.
 2. Name `arulmotors-hours`, region **asia-south1**, time zone **Asia/Kolkata**.
-3. Start: **Repeat daily**, 06:30. Stop: **Repeat daily**, 21:30.
+3. Start: **Repeat daily**, 07:00. Stop: **Repeat daily**, 21:30.
 4. Create → open the schedule → **Add instances to schedule** → `arulmotors` → Add.
 
 ### CLI (same thing)
@@ -1236,8 +1236,8 @@ gcloud projects add-iam-policy-binding project-2c317546-b2c6-4a7a-8d4 \
 ```bash
 gcloud compute resource-policies create instance-schedule arulmotors-hours \
   --region=asia-south1 --timezone=Asia/Kolkata \
-  --vm-start-schedule="30 6 * * *" --vm-stop-schedule="30 21 * * *" \
-  --description="Arul Motors VM: on 06:30-21:30 IST"
+  --vm-start-schedule="0 7 * * *" --vm-stop-schedule="30 21 * * *" \
+  --description="Arul Motors VM: on 07:00-21:30 IST"
 
 gcloud compute instances add-resource-policies arulmotors \
   --zone=asia-south1-c --resource-policies=arulmotors-hours
@@ -1260,7 +1260,11 @@ shows `start` / `stop` operations by the service agent.
 ### Change or remove
 
 ```bash
-# change times: create a new schedule, move the VM to it, delete the old one
+# change times in place (Console: open the schedule → Edit)
+gcloud compute resource-policies update instance-schedule arulmotors-hours \
+  --region=asia-south1 --vm-start-schedule="0 7 * * *"
+
+# remove it
 gcloud compute instances remove-resource-policies arulmotors \
   --zone=asia-south1-c --resource-policies=arulmotors-hours
 gcloud compute resource-policies delete arulmotors-hours --region=asia-south1
@@ -1283,7 +1287,9 @@ console; it stops again at the next 21:30.
   Service Agent ✓ (it already had `roles/compute.serviceAgent`).
 - Schedule `arulmotors-hours` created (asia-south1, Asia/Kolkata, start
   `30 6 * * *`, stop `30 21 * * *`), status READY, attached to `arulmotors` ✓.
-- VM was stopped at the time; first automatic start due 24 Oct 06:30 IST.
+- VM was stopped at the time.
+- Same day: start moved to **07:00** (`resource-policies update`, in place, no
+  re-attach needed). First automatic start due 24 Oct 07:00 IST.
 - First automatic stop / start seen: (check the next morning)
 
 ---
