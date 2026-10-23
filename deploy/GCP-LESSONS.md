@@ -1194,7 +1194,7 @@ only Monday–Saturday (`0 7 * * 1-6`).
   the voice page doesn't load. The CRM's live connection reconnects after start.
 - **Snapshots still run**: the daily snapshot (`default-schedule-1`, 22:00 UTC =
   03:30 IST) works on a stopped disk.
-- Schedules can run **up to ~15 minutes late**. Don't plan calls at 06:30 sharp.
+- Schedules can run **up to ~15 minutes late**. Calls at 07:00 sharp may find it still starting; allow until ~07:15.
 
 ### Cost
 
