@@ -91,7 +91,7 @@ account) or create the planned `arul-voice` VM. A static IP can be
 - [ ] **Lesson 7:** Logs, monitoring, **systemd** (keep apps running), troubleshooting
 - [ ] **Lesson 8:** Costs
 - [ ] **Lesson 9:** Real deployment of Arul Motors
-- [ ] **Lesson 10:** Instance schedule (VM off at night to save cost)
+- [x] **Lesson 10:** Instance schedule (VM off at night to save cost). 2026-10-23
 
 ---
 
@@ -1278,9 +1278,13 @@ console; it stops again at the next 21:30.
 
 ### What happened (fill in)
 
-- Date:
-- Permission granted:
-- First automatic stop / start seen:
+- Date: 2026-10-23 (set up from the CLI).
+- Permission granted: `roles/compute.instanceAdmin.v1` to the Compute Engine
+  Service Agent ✓ (it already had `roles/compute.serviceAgent`).
+- Schedule `arulmotors-hours` created (asia-south1, Asia/Kolkata, start
+  `30 6 * * *`, stop `30 21 * * *`), status READY, attached to `arulmotors` ✓.
+- VM was stopped at the time; first automatic start due 24 Oct 06:30 IST.
+- First automatic stop / start seen: (check the next morning)
 
 ---
 
