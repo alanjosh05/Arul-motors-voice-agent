@@ -40,6 +40,9 @@ def db(request, tmp_path, monkeypatch):
     import database
 
     monkeypatch.setattr(database, "DB_FILE", str(tmp_path / "test.db"))
+    # Tests book "n days ahead", which may be a Sunday: open every day unless a
+    # test sets closed days itself.
+    monkeypatch.setattr(database, "CLOSED_WEEKDAYS", set())
     if request.param == "mysql":
         for name in ("HOST", "PORT", "USER", "PASSWORD", "DATABASE"):
             monkeypatch.setenv(f"MYSQL_{name}", os.environ.get(f"TEST_MYSQL_{name}", ""))

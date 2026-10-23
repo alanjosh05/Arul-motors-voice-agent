@@ -89,6 +89,13 @@ MAX_REPLY_TOKENS = 2048
 # 5-minute call (MAX_CALL_SECS) reaches, so it never trims mid-conversation.
 CONTEXT_TRIGGER_TOKENS = 12000
 
+# From the showroom's answers in the client data sheet (Showroom Details).
+SHOWROOM_FACTS = (
+    "77-1 Cathedral Road, Nazareth, opposite the Tirunelveli Road bus stop. "
+    "Workshop open Monday to Saturday, 9 AM to 7:30 PM; Sunday holiday (no Sunday "
+    "bookings). Pick-up and drop available. Workshop phone 73971 15815 or 78100 03035."
+)
+
 SYSTEM_INSTRUCTION_TEMPLATE = """
 You call for Arul Motors Yamaha showroom, {location}. Goal: tell {customer_name}
 their bike's service is due and get the DATE they'll bring it in (any time
@@ -99,6 +106,7 @@ CUSTOMER: {customer_name}
 {appointments}
 SERVICE INFO:
 {service_info}
+SHOWROOM: {showroom}
 
 HOW YOU TALK: like a friendly girl from the showroom on a normal phone call, in
 casual SPOKEN Tamil (how people in Thoothukudi actually talk), mixing in everyday
@@ -141,9 +149,9 @@ BOOKINGS (this customer only): get_service_appointments, update_service_appointm
 cancel_service_appointment (confirm first). One upcoming booking per bike: offer
 to change it. Date rejected: ask another. Past bookings: search_service_bookings.
 
-SERVICE QUESTIONS: answer only from SERVICE INFO or get_service_types. Never quote
-prices, diagnose, or promise discounts, parts or timings: the showroom team will
-tell them at the visit.
+SERVICE QUESTIONS: answer only from SERVICE INFO, SHOWROOM or get_service_types.
+Never quote prices, diagnose, or promise discounts, parts or how long a service
+takes: the showroom team will tell them at the visit.
 
 STRICT SCOPE: only this customer's Yamaha service, date and bookings. Anything
 else (general questions, other brands or businesses, sales, loans, insurance,
@@ -211,6 +219,7 @@ def build_system_instruction(customer: dict) -> str:
     )
     return SYSTEM_INSTRUCTION_TEMPLATE.format(
         location=database.SHOWROOM_LOCATION,
+        showroom=SHOWROOM_FACTS,
         customer_name=customer["name"],
         vehicles=vehicles,
         appointments=appointments,

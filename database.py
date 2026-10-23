@@ -37,9 +37,9 @@ SHOWROOM_LOCATION = "Nazareth, Thoothukudi district, Tamil Nadu"
 # right even if the server runs in another timezone.
 SHOWROOM_TZ = ZoneInfo(os.getenv("SHOWROOM_TZ", "Asia/Kolkata"))
 #
-# Weekdays the workshop does not take bikes (Monday=0 ... Sunday=6). Empty means
-# open every day; e.g. {6} to stop customers choosing a Sunday.
-CLOSED_WEEKDAYS: set[int] = set()
+# Weekdays the workshop does not take bikes (Monday=0 ... Sunday=6). Arul
+# Motors' workshop is open Monday-Saturday; Sunday is the weekly holiday.
+CLOSED_WEEKDAYS: set[int] = {6}
 MAX_DAYS_AHEAD = 30
 
 # Yamaha service schedule, in order (used to label a bike's previous service).
@@ -409,6 +409,7 @@ def init_db():
       )
     """)
     for vehicle in cursor.fetchall():
+        previous = _previous_service_type(cursor, vehicle["next_service_type"])
         cursor.execute(
             """
         INSERT INTO service_appointments (id, vehicle_id, customer_id, appointment_date, service_type, notes, status)
@@ -419,7 +420,7 @@ def init_db():
                 vehicle["id"],
                 vehicle["customer_id"],
                 vehicle["last_service_date"],
-                _previous_service_type(vehicle["next_service_type"]),
+                previous,
                 "Recorded from the bike's last service date.",
             ),
         )
@@ -434,12 +435,17 @@ def _next_appointment_id(cursor) -> str:
     return f"AM{1001 + cursor.fetchone()['n']}"
 
 
-def _previous_service_type(next_service_type: str) -> str:
-    """The service before `next_service_type` in the Yamaha schedule."""
-    if next_service_type in SERVICE_SEQUENCE:
-        index = SERVICE_SEQUENCE.index(next_service_type)
-        return SERVICE_SEQUENCE[index - 1] if index > 0 else "Service"
-    return "Service"
+def _previous_service_type(cursor, next_service_type: str) -> str:
+    """The service before `next_service_type` in the workshop's schedule (the
+    scheduled service types, in order)."""
+    cursor.execute("SELECT name FROM service_types WHERE interval_days IS NOT NULL ORDER BY sort_order, id")
+    names = [row["name"].lower() for row in cursor.fetchall()] or [s.lower() for s in SERVICE_SEQUENCE]
+    index = names.index(next_service_type.lower()) if next_service_type.lower() in names else 0
+    if index == 0:
+        return "Service"
+    cursor.execute("SELECT name FROM service_types WHERE LOWER(name) = ?", (names[index - 1],))
+    row = cursor.fetchone()
+    return row["name"] if row else "Service"
 
 
 # ---------------------------------------------------------------------------

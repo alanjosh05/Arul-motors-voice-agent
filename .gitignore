@@ -15,3 +15,9 @@ application_default_credentials.json
 *.json
 *.db-wal
 *.db-shm
+
+# Client data (customer names and phone numbers): never commit
+*.xlsx
+*.xls
+*.csv
+backup-*.db

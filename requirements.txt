@@ -10,3 +10,4 @@ pymysql>=1.1
 # dev
 pytest
 pytest-asyncio
+openpyxl>=3.1  # import_client_data.py (client data workbook)
