@@ -91,6 +91,7 @@ account) or create the planned `arul-voice` VM. A static IP can be
 - [ ] **Lesson 7:** Logs, monitoring, **systemd** (keep apps running), troubleshooting
 - [ ] **Lesson 8:** Costs
 - [ ] **Lesson 9:** Real deployment of Arul Motors
+- [ ] **Lesson 10:** Instance schedule (VM off at night to save cost)
 
 ---
 
@@ -1164,6 +1165,122 @@ This path is cleaner but repeats work you've already done.
 - Date:
 - Path chosen:
 - First test call result:
+
+---
+
+## Lesson 10: Instance schedule (VM off at night)
+
+**AWS equivalent:** Instance Scheduler / an EventBridge rule that stops and
+starts EC2. In GCP it's built in: an **instance schedule** is a resource policy
+(the same kind of object as the snapshot schedule) attached to the VM.
+
+### Our schedule
+
+| | Time (IST) | Why |
+|---|---|---|
+| Start | **06:30** every day | The client's first calling window is 7–10 AM |
+| Stop | **21:30** every day | Last calling window ends 8 PM; workshop closes 7:30 PM |
+
+Off 9 h a night. Optional: keep it off all Sunday (weekly holiday) by starting
+only Monday–Saturday (`30 6 * * 1-6`).
+
+### What happens at stop / start
+
+- **Stop** is a normal shutdown: systemd stops `arul-api` and `arul-voice`
+  cleanly, so SQLite closes properly. Start boots the VM and systemd starts both
+  services by itself (they're `enabled`, Lesson 7). Nothing to do by hand.
+- The **static IP stays** (Lesson 4), so the domains keep working after start.
+- While off: the CRM shows "Can't reach the server", calls can't be made, and
+  the voice page doesn't load. The CRM's live connection reconnects after start.
+- **Snapshots still run**: the daily snapshot (`default-schedule-1`, 22:00 UTC =
+  03:30 IST) works on a stopped disk.
+- Schedules can run **up to ~15 minutes late**. Don't plan calls at 06:30 sharp.
+
+### Cost
+
+| | Per month |
+|---|---|
+| VM compute (e2-small) saved, ~270 h off | about −₹530 |
+| Static IP while the VM is off (billed at the "unused" rate) | about +₹130 |
+| **Net saving** | **about ₹400 (≈ 20% of the VM bill)** |
+
+Disk and snapshots cost the same whether the VM runs or not.
+
+### One-time permission (the step everyone misses)
+
+GCP stops/starts the VM as the **Compute Engine Service Agent**,
+`service-666692619275@compute-system.iam.gserviceaccount.com`. It needs
+permission to start and stop VMs, or the schedule silently fails
+(the VM page shows an error under *Instance schedule*).
+
+Console: **IAM & Admin → IAM → Grant access** → principal
+`service-666692619275@compute-system.iam.gserviceaccount.com` → role
+**Compute Instance Admin (v1)** → Save. (Tick *Include Google-provided role
+grants* to see it in the list afterwards.)
+
+```bash
+gcloud projects add-iam-policy-binding project-2c317546-b2c6-4a7a-8d4 \
+  --member=serviceAccount:service-666692619275@compute-system.iam.gserviceaccount.com \
+  --role=roles/compute.instanceAdmin.v1
+```
+
+### Console
+
+1. **Compute Engine → VM instances → Instance schedules** tab → **Create schedule**.
+2. Name `arulmotors-hours`, region **asia-south1**, time zone **Asia/Kolkata**.
+3. Start: **Repeat daily**, 06:30. Stop: **Repeat daily**, 21:30.
+4. Create → open the schedule → **Add instances to schedule** → `arulmotors` → Add.
+
+### CLI (same thing)
+
+```bash
+gcloud compute resource-policies create instance-schedule arulmotors-hours \
+  --region=asia-south1 --timezone=Asia/Kolkata \
+  --vm-start-schedule="30 6 * * *" --vm-stop-schedule="30 21 * * *" \
+  --description="Arul Motors VM: on 06:30-21:30 IST"
+
+gcloud compute instances add-resource-policies arulmotors \
+  --zone=asia-south1-c --resource-policies=arulmotors-hours
+```
+
+(Schedule format is cron: `minute hour day month weekday`.)
+
+### Check
+
+```bash
+gcloud compute resource-policies describe arulmotors-hours --region=asia-south1
+gcloud compute instances describe arulmotors --zone=asia-south1-c \
+  --format="value(resourcePolicies)"          # → .../arulmotors-hours
+```
+
+Next morning: Compute Engine → VM → **Observability/Logs**, or
+`gcloud compute operations list --filter="targetLink~arulmotors" --limit=5`
+shows `start` / `stop` operations by the service agent.
+
+### Change or remove
+
+```bash
+# change times: create a new schedule, move the VM to it, delete the old one
+gcloud compute instances remove-resource-policies arulmotors \
+  --zone=asia-south1-c --resource-policies=arulmotors-hours
+gcloud compute resource-policies delete arulmotors-hours --region=asia-south1
+```
+
+Need the VM outside hours (e.g. a late demo)? Just **Start** it in the
+console; it stops again at the next 21:30.
+
+### Remember
+
+- Instance schedule = resource policy attached to the VM (snapshot schedule =
+  resource policy attached to the **disk**).
+- The service agent needs **Compute Instance Admin (v1)**, or nothing happens.
+- Times are in the schedule's time zone (Asia/Kolkata); snapshot times are UTC.
+
+### What happened (fill in)
+
+- Date:
+- Permission granted:
+- First automatic stop / start seen:
 
 ---
 
