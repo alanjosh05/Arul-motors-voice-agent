@@ -865,3 +865,49 @@ async def test_call_guard_hangs_up(db, monkeypatch):
     await guard.process_frame(BotStoppedSpeakingFrame(), bot.FrameDirection.DOWNSTREAM)
     await asyncio.sleep(0.5)
     assert hung == ["goodbye finished"]
+
+
+def test_alternate_mobile_store_swap_search_and_migrate(db, monkeypatch, tmp_path):
+    client = _api_client(monkeypatch)
+    karthik = db.get_customer_by_mobile("9876543210")
+
+    # Set, validate, search by it, swap it in as the called number, remove it.
+    url = f"/api/customers/{karthik['id']}"
+    assert client.patch(url, json={"alternate_mobile": "98400 77777"}).status_code == 200
+    assert db.get_customer(karthik["id"])["alternate_mobile"] == "9840077777"
+    assert client.patch(url, json={"alternate_mobile": "9876543210"}).status_code == 400  # same as main
+    assert client.patch(url, json={"alternate_mobile": "123"}).status_code == 400
+    assert client.patch(url, json={"mobile_number": "9840077777"}).status_code == 400  # swap instead
+    assert [c["name"] for c in client.get("/api/customers", params={"q": "77777"}).json()] == ["Karthik Raja"]
+    swap = {"mobile_number": "9840077777", "alternate_mobile": "9876543210"}
+    assert client.patch(url, json=swap).status_code == 200
+    swapped = db.get_customer(karthik["id"])
+    assert (swapped["mobile_number"], swapped["alternate_mobile"]) == ("9840077777", "9876543210")
+    assert client.patch(url, json={"alternate_mobile": ""}).status_code == 200
+    assert db.get_customer(karthik["id"])["alternate_mobile"] is None
+    created = client.post("/api/customers", json={"name": "Two Phones", "mobile_number": "9000000001",
+                                                  "alternate_mobile": "9000000002"})
+    assert created.status_code == 201
+    assert db.get_customer(created.json()["id"])["alternate_mobile"] == "9000000002"
+
+    # Bookings search (and so the agent's lookup) matches the alternate too.
+    db.update_customer(karthik["id"], alternate_mobile="9840055555")
+    assert db.create_appointment(karthik["id"], days_ahead(2))[0]
+    found = db.search_appointments(mobile_number="9840055555")
+    assert found and {r["customer_id"] for r in found} == {karthik["id"]}
+
+    # A database from before the column existed gets it on start.
+    import sqlite3
+
+    if db.using_mysql():
+        return
+    old = tmp_path / "old-customers.db"
+    conn = sqlite3.connect(old)
+    conn.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, "
+                 "mobile_number TEXT NOT NULL UNIQUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    conn.execute("INSERT INTO customers (name, mobile_number) VALUES ('Old', '9111111111')")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(db, "DB_FILE", str(old))
+    db.init_db()
+    assert db.get_customer_by_mobile("9111111111")["alternate_mobile"] is None

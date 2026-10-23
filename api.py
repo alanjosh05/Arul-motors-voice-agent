@@ -384,11 +384,13 @@ def stats():
 class CustomerIn(BaseModel):
     name: str
     mobile_number: str
+    alternate_mobile: str | None = None
 
 
 class CustomerPatch(BaseModel):
     name: str | None = None
     mobile_number: str | None = None
+    alternate_mobile: str | None = None  # "" removes it; swap both to change the called number
 
 
 @api.get("/customers")
@@ -402,7 +404,7 @@ def get_customers(q: str | None = None):
 
 @api.post("/customers", status_code=201)
 def create_customer(body: CustomerIn):
-    return _check(database.create_customer(body.name, body.mobile_number))
+    return _check(database.create_customer(body.name, body.mobile_number, body.alternate_mobile))
 
 
 @api.get("/customers/{customer_id}")
@@ -415,7 +417,7 @@ def get_customer(customer_id: int):
 
 @api.patch("/customers/{customer_id}")
 def update_customer(customer_id: int, body: CustomerPatch):
-    return _check(database.update_customer(customer_id, body.name, body.mobile_number))
+    return _check(database.update_customer(customer_id, body.name, body.mobile_number, body.alternate_mobile))
 
 
 @api.delete("/customers/{customer_id}")
@@ -436,6 +438,7 @@ class VehicleIn(BaseModel):
     purchase_date: str | None = None
     odometer_km: int | None = None
     last_service_date: str | None = None
+    alternate_mobile: str | None = None  # used only when this creates the customer
 
 
 class VehiclePatch(BaseModel):

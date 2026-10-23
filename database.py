@@ -197,6 +197,22 @@ def _ensure_index(cursor, name: str, table: str, columns: str) -> None:
         cursor.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})")
 
 
+def _ensure_column(cursor, table: str, column: str, column_type: str) -> None:
+    """Add a column to a table created by an older version (SQLite and MySQL)."""
+    if using_mysql():
+        cursor.execute(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() "
+            "AND table_name = ? AND column_name = ? LIMIT 1",
+            (table, column),
+        )
+        exists = cursor.fetchone() is not None
+    else:
+        cursor.execute(f"PRAGMA table_info({table})")
+        exists = any(row["name"] == column for row in cursor.fetchall())
+    if not exists:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
 # Indexes for the lookups the CRM, the agent and the live feed make.
 INDEXES = [
     ("ix_vehicles_customer", "vehicles", "customer_id"),
@@ -226,9 +242,12 @@ def init_db():
         id {t['pk']},
         name {t['str']} NOT NULL,
         mobile_number {t['str']} NOT NULL UNIQUE,
+        alternate_mobile {t['str']},
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) {t['table']}
     """)
+    # Second number (many customers give two); the agent calls mobile_number.
+    _ensure_column(cursor, "customers", "alternate_mobile", t["str"])
 
     # Bikes bought from the showroom, with the next service that is due.
     cursor.execute(f"""
@@ -576,14 +595,19 @@ def add_customer_vehicle(
     purchase_date: str | None = None,
     odometer_km: int | None = None,
     last_service_date: str | None = None,
+    alternate_mobile: str | None = None,
 ) -> tuple[bool, str]:
-    """Add a bike sale (creating the customer if the mobile number is new)."""
+    """Add a bike sale (creating the customer, with `alternate_mobile`, if the
+    mobile number is new)."""
     name = (name or "").strip()
     mobile_number = (mobile_number or "").strip()
     registration_number = (registration_number or "").strip().upper()
     due = normalize_date(next_service_date)
     if not all([name, mobile_number, registration_number, model, next_service_type]) or not due:
         return (False, "Name, mobile, registration, model, service type and a valid due date are required.")
+    alternate_mobile, error = _check_alternate(alternate_mobile, mobile_number)
+    if error:
+        return (False, error)
 
     conn = _connect()
     cursor = conn.cursor()
@@ -598,7 +622,8 @@ def add_customer_vehicle(
         customer_id = row["id"]
     else:
         cursor.execute(
-            "INSERT INTO customers (name, mobile_number) VALUES (?, ?)", (name, mobile_number)
+            "INSERT INTO customers (name, mobile_number, alternate_mobile) VALUES (?, ?, ?)",
+            (name, mobile_number, alternate_mobile),
         )
         customer_id = cursor.lastrowid
 
@@ -943,7 +968,7 @@ def search_appointments(
 
     Every filter is optional and they combine with AND:
     - customer_name: partial / fuzzy ("karthick" finds "Karthik Raja")
-    - mobile_number: any part of the number ("3210" finds "9876543210")
+    - mobile_number: any part of either of the customer's numbers ("3210" finds "9876543210")
     - registration_number: spacing/case ignored, partial ("1234", "TN09AB1234")
     - model: partial, punctuation ignored ("fzs" finds "Yamaha FZ-S Fi")
     - service_type: partial ("free" finds every free service)
@@ -956,7 +981,7 @@ def search_appointments(
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute("""
-    SELECT a.*, c.name AS customer_name, c.mobile_number, v.registration_number, v.model
+    SELECT a.*, c.name AS customer_name, c.mobile_number, c.alternate_mobile, v.registration_number, v.model
     FROM service_appointments a
     JOIN customers c ON c.id = a.customer_id
     JOIN vehicles v ON v.id = a.vehicle_id
@@ -975,7 +1000,10 @@ def search_appointments(
             continue
         # A filter with nothing usable in it (e.g. a mobile search without
         # digits) matches nothing, not everything.
-        if mobile_number and (not _digits(mobile_number) or _digits(mobile_number) not in _digits(row["mobile_number"])):
+        if mobile_number and (
+            not _digits(mobile_number)
+            or not any(_digits(mobile_number) in _digits(n) for n in (row["mobile_number"], row["alternate_mobile"]))
+        ):
             continue
         if registration_number and (
             not _alnum(registration_number) or _alnum(registration_number) not in _alnum(row["registration_number"])
@@ -1109,13 +1137,14 @@ def list_customers(query: str | None = None) -> list:
         customer["last_call"] = last_calls.get(cid)
         if query:
             haystack = " ".join(
-                [customer["name"], customer["mobile_number"]]
+                [customer["name"], customer["mobile_number"], customer.get("alternate_mobile") or ""]
                 + [f"{v['registration_number']} {v['model']}" for v in customer["vehicles"]]
             )
             if not (
                 _name_matches(query, customer["name"])
                 or _alnum(query) in _alnum(haystack)
                 or (_digits(query) and _digits(query) in _digits(customer["mobile_number"]))
+                or (_digits(query) and _digits(query) in _digits(customer.get("alternate_mobile")))
             ):
                 continue
         results.append(customer)
@@ -1139,17 +1168,37 @@ def get_customer_detail(customer_id: int) -> dict | None:
     return customer
 
 
-def create_customer(name: str, mobile_number: str) -> tuple[bool, str, int | None]:
+def _check_alternate(alternate: str | None, main: str) -> tuple[str | None, str | None]:
+    """Cleaned alternate number (None = no second number), or an error."""
+    alternate = _clean_mobile(alternate)
+    if not alternate:
+        return None, None
+    if len(_digits(alternate)) < 10:
+        return None, "Enter a 10-digit alternate number, or leave it empty."
+    if same_mobile(alternate, main):
+        return None, "The alternate number is the same as the main number."
+    return alternate, None
+
+
+def create_customer(
+    name: str, mobile_number: str, alternate_mobile: str | None = None
+) -> tuple[bool, str, int | None]:
     name, mobile_number = (name or "").strip(), _clean_mobile(mobile_number)
     if not name or len(_digits(mobile_number)) < 10:
         return (False, "A name and a 10-digit mobile number are required.", None)
+    alternate_mobile, error = _check_alternate(alternate_mobile, mobile_number)
+    if error:
+        return (False, error, None)
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM customers WHERE mobile_number = ?", (mobile_number,))
     if cursor.fetchone():
         conn.close()
         return (False, f"A customer with mobile {mobile_number} already exists.", None)
-    cursor.execute("INSERT INTO customers (name, mobile_number) VALUES (?, ?)", (name, mobile_number))
+    cursor.execute(
+        "INSERT INTO customers (name, mobile_number, alternate_mobile) VALUES (?, ?, ?)",
+        (name, mobile_number, alternate_mobile),
+    )
     customer_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -1158,10 +1207,23 @@ def create_customer(name: str, mobile_number: str) -> tuple[bool, str, int | Non
 
 
 def update_customer(
-    customer_id: int, name: str | None = None, mobile_number: str | None = None
+    customer_id: int,
+    name: str | None = None,
+    mobile_number: str | None = None,
+    alternate_mobile: str | None = None,
 ) -> tuple[bool, str]:
-    if not get_customer(customer_id):
+    """Edit a customer. alternate_mobile="" removes the second number; sending
+    both numbers swapped makes the alternate the main (called) number."""
+    current = get_customer(customer_id)
+    if not current:
         return (False, "Customer not found.")
+    set_alternate = alternate_mobile is not None  # "" clears it
+    if set_alternate:
+        alternate_mobile, error = _check_alternate(alternate_mobile, mobile_number or current["mobile_number"])
+        if error:
+            return (False, error)
+    elif mobile_number is not None and same_mobile(mobile_number, current.get("alternate_mobile")):
+        return (False, "That number is already the alternate. Swap the two numbers instead.")
     conn = _connect()
     cursor = conn.cursor()
     if name is not None:
@@ -1181,6 +1243,8 @@ def update_customer(
             conn.close()
             return (False, f"Another customer already uses {mobile_number}.")
         cursor.execute("UPDATE customers SET mobile_number = ? WHERE id = ?", (mobile_number, customer_id))
+    if set_alternate:
+        cursor.execute("UPDATE customers SET alternate_mobile = ? WHERE id = ?", (alternate_mobile, customer_id))
     conn.commit()
     conn.close()
     _record_change(CUSTOMER_ENTITIES, customer_id)

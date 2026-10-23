@@ -344,6 +344,7 @@ class ServiceCall:
                 row["customer_id"] == self.customer_id
                 or database.same_registration(query, row["registration_number"])
                 or database.same_mobile(query, row["mobile_number"])
+                or database.same_mobile(query, row["alternate_mobile"])
             )
 
         shown = [row for row in rows if visible(row)]

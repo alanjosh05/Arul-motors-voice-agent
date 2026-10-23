@@ -4,8 +4,8 @@
     python import_client_data.py Arul-Motors-Customer-Data.xlsx --apply   # write
 
 Sheets used: "Service Types" (the workshop's schedule) and "Customers & Bikes"
-(one row per bike). A row with only a mobile number is an extra number for
-the customer above it. Re-running is safe: bikes are matched by registration
+(one row per bike). A row with only a mobile number is the alternate number of
+the customer above it (the agent calls the main one). Re-running is safe: bikes are matched by registration
 and updated, service types by name.
 
 The report masks mobile numbers; the workbook itself must never be committed.
@@ -162,6 +162,37 @@ def dedupe(bikes: list[dict], problems: list[str]) -> list[dict]:
     return list(keep.values())
 
 
+def pick_alternates(extra: dict[str, list[str]], customers: dict[str, str], problems: list[str]) -> dict[str, str]:
+    """One alternate per customer (main mobile -> alternate); the CRM stores one."""
+    alternates = {}
+    for main, numbers in extra.items():
+        if main not in customers:
+            continue  # the customer's row was skipped
+        distinct = [n for n in dict.fromkeys(numbers) if len(n) == 10 and n != main]
+        if distinct:
+            alternates[main] = distinct[0]
+        if len(distinct) > 1:
+            problems.append(
+                f"{customers[main]}: {len(distinct)} extra numbers; kept {_mask(distinct[0])} as the alternate, "
+                f"not stored: {', '.join(_mask(n) for n in distinct[1:])}."
+            )
+    return alternates
+
+
+def apply_alternates(alternates: dict[str, str]) -> None:
+    done = 0
+    for main, alternate in alternates.items():
+        customer = database.get_customer_by_mobile(main)
+        if not customer:
+            continue
+        ok, message = database.update_customer(customer["id"], alternate_mobile=alternate)
+        if ok:
+            done += 1
+        else:
+            print(f"  ERR alternate for {customer['name']}: {message}")
+    print(f"  ok  alternate numbers: {done} saved")
+
+
 def apply_service_types(types: list[dict]) -> None:
     existing = {t["name"].lower(): t for t in database.list_service_types()}
     for t in types:
@@ -272,10 +303,8 @@ def main() -> int:
         interval = f"every {t['interval_days']} days / {t['interval_km']} km" if t["interval_days"] else "on request"
         print(f"  - {t['name']} ({'free' if t['is_free'] else 'paid'}, {interval})")
     print(f"Customers: {len(customers)}   Bikes: {len(bikes)}")
-    if extra_numbers:
-        count = sum(len(v) for v in extra_numbers.values())
-        print(f"Extra mobile numbers: {count} for {len(extra_numbers)} customers "
-              "(not stored: the CRM keeps one number per customer; the first one is called).")
+    alternates = pick_alternates(extra_numbers, customers, problems)
+    print(f"Alternate numbers: {len(alternates)}")
     print(f"\nNotes ({len(problems)}):" if problems else "\nNo problems found.")
     for p in problems:
         print(f"  - {p}")
@@ -287,6 +316,7 @@ def main() -> int:
     print("\nWriting to", database.DB_FILE)
     apply_service_types(types)
     apply_bikes(bikes)
+    apply_alternates(alternates)
     print("Done.")
     return 0
 
