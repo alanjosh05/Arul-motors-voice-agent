@@ -31,7 +31,8 @@ fi
 # the code on first start and is never overwritten by this script.
 id arul >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin arul
 mkdir -p "$APP"
-cp "$SRC/bot.py" "$SRC/database.py" "$SRC/api.py" "$SRC/auth.py" "$SRC/requirements.txt" "$APP/"
+# Every app module (api.py imports auth, crm_export, database; tests stay behind).
+cp "$SRC"/*.py "$SRC/requirements.txt" "$APP/"
 install -m 755 "$SRC/deploy/backup-db.sh" "$APP/backup-db.sh"
 if [ ! -f "$APP/.env" ]; then
   cat > "$APP/.env" <<ENV
