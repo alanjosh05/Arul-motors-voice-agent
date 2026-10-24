@@ -300,11 +300,14 @@ def init_db():
         outcome {t['str']} NOT NULL,
         callback_date {t['day']},
         notes TEXT,
+        appointment_id {t['id']},
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (customer_id) REFERENCES customers(id),
         FOREIGN KEY (vehicle_id) REFERENCES vehicles(id)
     ) {t['table']}
     """)
+    # The booking a "date confirmed" call made, so cancelling it removes the call too.
+    _ensure_column(cursor, "call_logs", "appointment_id", t["id"])
 
     # CRM staff logins (dashboard users). Passwords are stored as scrypt hashes.
     cursor.execute(f"""
@@ -848,7 +851,8 @@ def cancel_appointment(
     customer_id: int, appointment_id: str | None = None, actor: str = "agent"
 ) -> tuple[bool, str]:
     """Cancel an appointment: it is deleted with every trace of it (its "booked"
-    and "missed" notifications), so it never shows up as a service again."""
+    and "missed" notifications, and the agent's "date confirmed" call entry and
+    notification for it), so it never shows up as booked or serviced again."""
     conn = _connect()
     cursor = conn.cursor()
     appointment, error = _get_own_appointment(cursor, customer_id, appointment_id)
@@ -856,13 +860,14 @@ def cancel_appointment(
         conn.close()
         return (False, error)
     cursor.execute("DELETE FROM service_appointments WHERE id = ?", (appointment["id"],))
+    cursor.execute("DELETE FROM call_logs WHERE appointment_id = ?", (appointment["id"],))
     cursor.execute(
-        "DELETE FROM events WHERE event_ref IN (?, ?)",
-        (f"booking:{appointment['id']}", f"missed:{appointment['id']}"),
+        "DELETE FROM events WHERE event_ref IN (?, ?, ?)",
+        (f"booking:{appointment['id']}", f"missed:{appointment['id']}", f"call-booking:{appointment['id']}"),
     )
     conn.commit()
     conn.close()
-    _record_change(BOOKING_ENTITIES, customer_id)
+    _record_change([*BOOKING_ENTITIES, "calls"], customer_id)
     return (
         True,
         f"Appointment {appointment['id']} on {_spoken(appointment['appointment_date'])} has been cancelled.",
@@ -1046,15 +1051,19 @@ def log_call(
     callback_date: str | None = None,
     notes: str | None = None,
     actor: str = "agent",
+    appointment_id: str | None = None,
 ) -> tuple[bool, str]:
+    """Record a call's outcome. `appointment_id`: the booking this call made
+    (date_confirmed); cancelling that booking deletes this entry too."""
     outcome = (outcome or "").strip().lower()
     if outcome not in CALL_OUTCOMES:
         return (False, f"Unknown outcome '{outcome}'. Use one of: {', '.join(sorted(CALL_OUTCOMES))}.")
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO call_logs (customer_id, vehicle_id, outcome, callback_date, notes) VALUES (?, ?, ?, ?, ?)",
-        (customer_id, vehicle_id, outcome, normalize_date(callback_date) or callback_date, notes),
+        "INSERT INTO call_logs (customer_id, vehicle_id, outcome, callback_date, notes, appointment_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (customer_id, vehicle_id, outcome, normalize_date(callback_date) or callback_date, notes, appointment_id),
     )
     conn.commit()
     conn.close()
@@ -1062,7 +1071,10 @@ def log_call(
     if actor == "agent" and outcome in OUTCOME_NOTIFICATIONS:
         level, title = OUTCOME_NOTIFICATIONS[outcome]
         detail = f"Call back on {_human_day(normalize_date(callback_date) or callback_date)}" if callback_date else (notes or "")
-        notify(f"call_{outcome}", level, f"{title} · {_customer_name(customer_id)}", detail, customer_id)
+        notify(
+            f"call_{outcome}", level, f"{title} · {_customer_name(customer_id)}", detail, customer_id,
+            ref=f"call-booking:{appointment_id}" if appointment_id else None,
+        )
     return (True, f"Call outcome '{outcome}' saved.")
 
 

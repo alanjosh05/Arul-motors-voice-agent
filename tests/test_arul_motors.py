@@ -1030,3 +1030,19 @@ def test_interruptions_and_no_repeats(db):
     tomorrow = (db.today() + timedelta(days=1)).isoformat()
     assert f"({tomorrow})" in prompt
     assert "அச்சச்சோ" not in prompt and "Super" not in prompt
+
+
+def test_cancel_removes_the_call_that_booked_it(db):
+    """After cancelling, the customer mustn't still show 'Date confirmed' from
+    the agent's call that made the booking; other calls stay."""
+    ok, _, aid = db.create_appointment(1, days_ahead(2))
+    assert ok
+    db.log_call(1, "no_answer")  # an unrelated earlier call
+    db.log_call(1, "date_confirmed", notes="Coming soon", appointment_id=aid)
+    assert db.event_ref_exists(f"booking:{aid}")  # the "Service booked" notification
+    assert [c["outcome"] for c in db.get_call_logs(1)] == ["date_confirmed", "no_answer"]
+
+    assert db.cancel_appointment(1, aid, actor="staff:admin")[0]
+    assert [c["outcome"] for c in db.get_call_logs(1)] == ["no_answer"]
+    assert not db.event_ref_exists(f"booking:{aid}")
+    assert next(c for c in db.list_customers() if c["id"] == 1)["last_call"]["outcome"] == "no_answer"

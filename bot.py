@@ -262,6 +262,7 @@ class ServiceCall:
         # The visit date agreed on this call (shown in the CRM and call log).
         self.booked_date: str | None = None
         self.booked_service: str | None = None
+        self.booked_id: str | None = None
         self.ending = False  # end_call was requested
 
     async def get_current_datetime(self, params: FunctionCallParams) -> None:
@@ -293,6 +294,7 @@ class ServiceCall:
     def _remember_booking(self, appointment_id: str | None) -> None:
         booking = database.get_appointment(appointment_id) if appointment_id else None
         if booking:
+            self.booked_id = booking["id"]
             self.booked_date = booking["appointment_date"]
             self.booked_service = booking["service_type"]
 
@@ -329,7 +331,7 @@ class ServiceCall:
         logger.info(f"Cancelling appointment {appointment_id} for customer {self.customer_id}")
         ok, message = database.cancel_appointment(self.customer_id, appointment_id)
         if ok:
-            self.booked_date = self.booked_service = None
+            self.booked_date = self.booked_service = self.booked_id = None
         await params.result_callback(message)
 
     async def get_service_types(self, params: FunctionCallParams) -> None:
@@ -416,6 +418,7 @@ class ServiceCall:
             vehicle_id=vehicle["id"],
             callback_date=args.get("callback_date"),
             notes=notes,
+            appointment_id=self.booked_id if outcome == "date_confirmed" else None,
         )
         if ok:
             self.outcome_logged = True
