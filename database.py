@@ -396,7 +396,8 @@ def init_db():
     # Seed demo customers if empty. Dates are relative to today so the demo
     # always has upcoming services to call about.
     cursor.execute("SELECT count(*) AS n FROM customers")
-    if cursor.fetchone()["n"] == 0 and _seed_demo():
+    seeded = cursor.fetchone()["n"] == 0 and _seed_demo()
+    if seeded:
         seed_day = today()
         # name, mobile, registration, model, bought (days ago), last service
         # (days ago, None = never), odometer km, due in (days), service type
@@ -428,31 +429,37 @@ def init_db():
                 ),
             )
 
-    # Service history: record each bike's last service as a COMPLETED
-    # appointment (once), so previous services show up in searches.
-    cursor.execute("""
-    SELECT * FROM vehicles v
-    WHERE v.last_service_date IS NOT NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM service_appointments a WHERE a.vehicle_id = v.id AND a.status = 'COMPLETED'
-      )
-    """)
-    for vehicle in cursor.fetchall():
-        previous = _previous_service_type(cursor, vehicle["next_service_type"])
-        cursor.execute(
-            """
-        INSERT INTO service_appointments (id, vehicle_id, customer_id, appointment_date, service_type, notes, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'COMPLETED')
-        """,
-            (
-                _next_appointment_id(cursor),
-                vehicle["id"],
-                vehicle["customer_id"],
-                vehicle["last_service_date"],
-                previous,
-                "Recorded from the bike's last service date.",
-            ),
-        )
+    # Demo data only: record each seeded bike's last service as a COMPLETED
+    # appointment, so the demo has service history. Real history comes from
+    # "Mark as serviced" and the client-data import, never from a restart
+    # (that once turned an edited "last service date" into a service record).
+    if seeded:
+        cursor.execute("""
+        SELECT * FROM vehicles v
+        WHERE v.last_service_date IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM service_appointments a WHERE a.vehicle_id = v.id AND a.status = 'COMPLETED'
+          )
+        """)
+        for vehicle in cursor.fetchall():
+            previous = _previous_service_type(cursor, vehicle["next_service_type"])
+            cursor.execute(
+                """
+            INSERT INTO service_appointments (id, vehicle_id, customer_id, appointment_date, service_type, notes, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'COMPLETED')
+            """,
+                (
+                    _next_appointment_id(cursor),
+                    vehicle["id"],
+                    vehicle["customer_id"],
+                    vehicle["last_service_date"],
+                    previous,
+                    "Recorded from the bike's last service date.",
+                ),
+            )
+
+    # Cancelling deletes a booking outright; clear any left from before that.
+    cursor.execute("DELETE FROM service_appointments WHERE status = 'CANCELLED'")
 
     conn.commit()
     conn.close()
@@ -840,26 +847,22 @@ def update_appointment(
 def cancel_appointment(
     customer_id: int, appointment_id: str | None = None, actor: str = "agent"
 ) -> tuple[bool, str]:
-    """Cancel (soft-delete) an appointment; the row is kept with status CANCELLED."""
+    """Cancel an appointment: it is deleted with every trace of it (its "booked"
+    and "missed" notifications), so it never shows up as a service again."""
     conn = _connect()
     cursor = conn.cursor()
     appointment, error = _get_own_appointment(cursor, customer_id, appointment_id)
     if error:
         conn.close()
         return (False, error)
+    cursor.execute("DELETE FROM service_appointments WHERE id = ?", (appointment["id"],))
     cursor.execute(
-        "UPDATE service_appointments SET status = 'CANCELLED' WHERE id = ?", (appointment["id"],)
+        "DELETE FROM events WHERE event_ref IN (?, ?)",
+        (f"booking:{appointment['id']}", f"missed:{appointment['id']}"),
     )
     conn.commit()
     conn.close()
     _record_change(BOOKING_ENTITIES, customer_id)
-    if actor == "agent":
-        notify(
-            "booking_cancelled", "warning",
-            f"Booking cancelled · {_customer_name(customer_id)}",
-            f"{appointment['id']} for {_human_day(appointment['appointment_date'])} was cancelled on the call.",
-            customer_id,
-        )
     return (
         True,
         f"Appointment {appointment['id']} on {_spoken(appointment['appointment_date'])} has been cancelled.",

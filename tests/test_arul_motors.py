@@ -149,9 +149,22 @@ def test_update_and_cancel(db):
     ok, msg = db.cancel_appointment(2, appointment_id.lower())
     assert ok, msg
     assert db.get_appointments(2) == []
-    # Soft delete: the row is kept as CANCELLED.
+    # Cancelling deletes the booking and its notifications: only the real
+    # (completed) service history is left.
     history = db.get_appointments(2, include_cancelled=True)
-    assert {h["status"] for h in history} == {"CANCELLED", "COMPLETED"}
+    assert {h["status"] for h in history} == {"COMPLETED"}
+    assert not db.event_ref_exists(f"booking:{appointment_id}")
+    assert db.search_appointments(appointment_id=appointment_id) == []
+
+
+def test_restart_never_invents_service_history(db):
+    """Editing a bike's last service date, then restarting, must not add a
+    'completed service' the customer never had (only demo seeding does)."""
+    bike = db.get_customer(1)["vehicles"][0]  # Karthik: never serviced
+    before = len(db.get_appointments(1, include_cancelled=True))
+    assert db.update_vehicle(bike["id"], last_service_date=days_ahead(-20))[0]
+    db.init_db()  # what a service restart does
+    assert len(db.get_appointments(1, include_cancelled=True)) == before
 
 
 def test_clock_uses_showroom_timezone(db):
@@ -552,9 +565,9 @@ def test_crm_customers_vehicles_bookings_and_stats(db, monkeypatch):
     assert client.patch(f"/api/appointments/{aid}", json={"appointment_date": days_ahead(4)}).status_code == 200
     assert client.get(f"/api/appointments/{aid}").json()["appointment_date"] == days_ahead(4)
     assert client.post(f"/api/appointments/{aid}/cancel").status_code == 200
-    assert client.get(f"/api/appointments/{aid}").json()["state"] == "cancelled"
+    assert client.get(f"/api/appointments/{aid}").status_code == 404  # deleted, no trace
     assert client.post("/api/appointments", json={"customer_id": cid, "appointment_date": "2000-01-01"}).status_code == 400
-    assert client.get("/api/appointments", params={"state": "cancelled"}).json()[0]["id"] == aid
+    assert client.get("/api/appointments", params={"state": "cancelled"}).json() == []
 
     # Staff-logged call + dashboard stats.
     assert client.post("/api/calls/log", json={"customer_id": cid, "outcome": "date_confirmed"}).status_code == 201
