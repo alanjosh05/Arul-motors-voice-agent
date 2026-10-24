@@ -789,6 +789,11 @@ async def run_bot(transport, customer: dict, is_webrtc: bool, started_by: str | 
 
 async def bot(runner_args: RunnerArguments) -> None:
     """Entry point invoked by the Pipecat runner for each session."""
+    # Switched off by an admin in the CRM: refuse every session, including the
+    # voice test page (the CRM's relay already refuses before reaching here).
+    if not database.voice_agent_enabled():
+        logger.warning("Voice agent is turned off in the CRM settings; session refused.")
+        return
     transport = await create_transport(
         runner_args,
         {

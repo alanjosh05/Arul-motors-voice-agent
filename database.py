@@ -356,6 +356,16 @@ def init_db():
     ) {t['table']}
     """)
 
+    # Showroom-wide settings changed from the CRM (admins), e.g. whether the
+    # voice agent may take calls. One row per setting; missing = default.
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS app_settings (
+        name {t['str']} PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) {t['table']}
+    """)
+
     # Voice-agent calls: open rows (ended_at NULL) are calls in progress.
     cursor.execute(f"""
     CREATE TABLE IF NOT EXISTS voice_calls (
@@ -1738,6 +1748,51 @@ def emit_event(event_type: str, payload: dict, ref: str | None = None) -> int | 
 
 def _record_change(entities: list[str], customer_id: int | None = None) -> None:
     emit_event("data.changed", {"entities": entities, "customer_id": customer_id})
+
+
+# ---------------------------------------------------------------------------
+# Settings (showroom-wide, changed by admins in the CRM)
+# ---------------------------------------------------------------------------
+SETTING_DEFAULTS = {"voice_agent_enabled": "1"}
+
+
+def _get_setting(name: str) -> str:
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM app_settings WHERE name = ?", (name,))
+    row = cursor.fetchone()
+    conn.close()
+    return row["value"] if row else SETTING_DEFAULTS[name]
+
+
+def voice_agent_enabled() -> bool:
+    """False when an admin has switched the voice agent off: no calls start."""
+    return _get_setting("voice_agent_enabled") == "1"
+
+
+def get_settings() -> dict:
+    return {"voice_agent_enabled": voice_agent_enabled()}
+
+
+def set_voice_agent_enabled(enabled: bool, actor: str | None = None) -> tuple[bool, str]:
+    value = "1" if enabled else "0"
+    conn = _connect()
+    cursor = conn.cursor()
+    # Check, then update or insert (MySQL's rowcount is 0 for an unchanged value).
+    cursor.execute("SELECT 1 FROM app_settings WHERE name = ?", ("voice_agent_enabled",))
+    if cursor.fetchone():
+        cursor.execute(
+            "UPDATE app_settings SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?", (value, "voice_agent_enabled")
+        )
+    else:
+        cursor.execute("INSERT INTO app_settings (name, value) VALUES (?, ?)", ("voice_agent_enabled", value))
+    conn.commit()
+    conn.close()
+    _record_change(["settings"])
+    state = "on" if enabled else "off"
+    notify("settings", "info" if enabled else "warning", f"Voice agent turned {state}",
+           f"By {actor}." if actor else "")
+    return (True, f"Voice agent turned {state}.")
 
 
 def notify(

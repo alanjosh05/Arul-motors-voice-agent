@@ -911,3 +911,38 @@ def test_alternate_mobile_store_swap_search_and_migrate(db, monkeypatch, tmp_pat
     monkeypatch.setattr(db, "DB_FILE", str(old))
     db.init_db()
     assert db.get_customer_by_mobile("9111111111")["alternate_mobile"] is None
+
+
+def test_admin_can_switch_the_voice_agent_off(db, monkeypatch):
+    import auth
+
+    client = _api_client(monkeypatch)  # admin
+    assert client.get("/api/settings").json() == {"voice_agent_enabled": True}
+
+    # Staff can read the setting but not change it.
+    db.create_staff_user("desk", auth.hash_password("password123"), "Desk", "staff")
+    from fastapi.testclient import TestClient
+
+    import api
+
+    staff = TestClient(api.app)
+    token = staff.post("/api/auth/login", json={"username": "desk", "password": "password123"}).json()["token"]
+    staff.headers["Authorization"] = f"Bearer {token}"
+    assert staff.get("/api/settings").json()["voice_agent_enabled"] is True
+    assert staff.patch("/api/settings", json={"voice_agent_enabled": False}).status_code == 403
+
+    # Admin turns it off: no calls start, status says so, everyone is told.
+    before = db.latest_event_id()
+    assert client.patch("/api/settings", json={"voice_agent_enabled": False}).json() == {"voice_agent_enabled": False}
+    assert db.voice_agent_enabled() is False
+    offer = {"sdp": "x", "type": "offer", "requestData": {"customer_id": 1}}
+    refused = client.post("/api/voice/offer", json=offer)
+    assert refused.status_code == 403 and "turned off" in refused.json()["detail"]
+    assert client.get("/api/voice/status").json() == {"online": False, "enabled": False}
+    types = [e["type"] for e in db.get_events_after(before)]
+    assert "data.changed" in types and "notification" in types
+
+    # Unchanged value again (MySQL reports 0 rows) and back on.
+    assert client.patch("/api/settings", json={"voice_agent_enabled": False}).status_code == 200
+    assert client.patch("/api/settings", json={"voice_agent_enabled": True}).json() == {"voice_agent_enabled": True}
+    assert db.voice_agent_enabled() is True

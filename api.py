@@ -726,6 +726,28 @@ def _ice_servers() -> list[dict]:
     return [{"urls": url.strip()} for url in value.split(",") if url.strip()]
 
 
+# ---------------------------------------------------------------------------
+# Settings (read: any staff; change: admins)
+# ---------------------------------------------------------------------------
+class SettingsPatch(BaseModel):
+    voice_agent_enabled: bool | None = None
+
+
+@api.get("/settings")
+def get_settings():
+    return database.get_settings()
+
+
+@api.patch("/settings")
+def update_settings(body: SettingsPatch, user: dict = Depends(admin_user)):
+    if body.voice_agent_enabled is not None:
+        database.set_voice_agent_enabled(body.voice_agent_enabled, user.get("full_name") or user["username"])
+    return database.get_settings()
+
+
+VOICE_OFF = "The voice agent is turned off. An admin can turn it on in Settings."
+
+
 @api.get("/voice/config")
 def voice_config():
     """What the CRM's call panel needs: the relay endpoint and ICE servers."""
@@ -734,13 +756,15 @@ def voice_config():
 
 @api.get("/voice/status")
 async def voice_status():
-    """Whether the voice agent is reachable from the API."""
+    """Whether the voice agent is switched on and reachable from the API."""
+    if not await asyncio.to_thread(database.voice_agent_enabled):
+        return {"online": False, "enabled": False}
     try:
         async with httpx.AsyncClient(timeout=3) as client:
             response = await client.get(f"{BOT_INTERNAL_URL}/client/")
-        return {"online": response.status_code < 500}
+        return {"online": response.status_code < 500, "enabled": True}
     except httpx.HTTPError:
-        return {"online": False}
+        return {"online": False, "enabled": True}
 
 
 async def _relay_to_bot(method: str, payload: dict) -> dict:
@@ -759,6 +783,8 @@ async def voice_offer(request: Request, user: dict = Depends(current_user)):
     """Relay the browser's WebRTC offer to the bot. The customer to call comes
     from `requestData.customer_id` and is checked here, so only signed-in
     staff can start calls, for real customers."""
+    if not await asyncio.to_thread(database.voice_agent_enabled):
+        raise HTTPException(status_code=403, detail=VOICE_OFF)
     payload = await request.json()
     request_data = payload.pop("requestData", None) or payload.get("request_data") or {}
     try:
