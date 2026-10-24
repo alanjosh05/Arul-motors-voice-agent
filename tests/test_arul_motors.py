@@ -321,8 +321,8 @@ def test_bot_module_imports(db, monkeypatch, tmp_path):
     assert "Karthik Raja" in prompt and "TN 09 AB 1234" in prompt
     assert "Yamaha" in prompt and "Nazareth" in prompt and "spoken tamil" in prompt.lower()
     assert "Thoothukudi" in prompt
-    # The date is not baked into the prompt: the agent must use the datetime tool.
-    assert db.today().isoformat() not in prompt
+    # Today's dates are in the prompt (a mid-call lookup made the agent repeat itself).
+    assert f"({db.today().isoformat()})" in prompt and "TODAY" in prompt
     assert "Nazareth" in bot.GREETING_KICKOFF
     assert "Meera" not in prompt and "Meera" not in bot.GREETING_KICKOFF
 
@@ -997,29 +997,23 @@ def test_cors_exposes_download_file_names(db, monkeypatch):
     assert "content-disposition" in r.headers.get("access-control-expose-headers", "").lower()
 
 
-def test_agent_finishes_its_sentences(db):
-    """Customers' "ம்ம்"/"சரி" while the agent talks must not cut it off."""
-    import asyncio
+def test_interruptions_and_no_repeats(db):
+    """The customer can interrupt (Gemini's default barge-in, no override), but a
+    short "ம்ம்" isn't long enough to cut the agent off; and the agent has today's
+    dates up front instead of looking them up mid-reply."""
+    from google.genai.types import StartSensitivity
 
     import bot
-    from google.genai.types import ActivityHandling, LiveConnectConfig
 
-    seen = {}
+    llm = bot._build_llm(db.get_customer(1))
+    assert type(llm) is bot.GeminiLiveVertexLLMService
+    vad = llm._settings.vad
+    assert vad.prefix_padding_ms == 500 and vad.start_sensitivity == StartSensitivity.START_SENSITIVITY_LOW
 
-    async def fake_connect(self, config):
-        seen["config"] = config
-
-    original = bot.GeminiLiveVertexLLMService._connection_task_handler
-    bot.GeminiLiveVertexLLMService._connection_task_handler = fake_connect
-    try:
-        llm = bot.FinishSentencesGeminiLive.__new__(bot.FinishSentencesGeminiLive)
-        asyncio.run(llm._connection_task_handler(LiveConnectConfig()))
-    finally:
-        bot.GeminiLiveVertexLLMService._connection_task_handler = original
-    assert seen["config"].realtime_input_config.activity_handling == ActivityHandling.NO_INTERRUPTION
-    assert isinstance(bot._build_llm(db.get_customer(1)), bot.FinishSentencesGeminiLive)
-
-    # Polite, clear tone in the prompt; no slang reactions.
     prompt = bot.build_system_instruction(db.get_customer(1))
     assert "polite" in prompt and "COMPLETE sentences" in prompt
+    assert "Interrupted: stop" in prompt and "don't" in prompt and "start over" in prompt
+    assert "Dates come from TODAY" in prompt and "get_current_datetime once" not in prompt
+    tomorrow = (db.today() + timedelta(days=1)).isoformat()
+    assert f"({tomorrow})" in prompt
     assert "அச்சச்சோ" not in prompt and "Super" not in prompt

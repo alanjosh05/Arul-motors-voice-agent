@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 # [Plivo disabled — pending client decision on telephony]
 # from fastapi import Request
 # from fastapi.responses import Response
-from google.genai.types import ActivityHandling, EndSensitivity, RealtimeInputConfig, StartSensitivity
+from google.genai.types import EndSensitivity, StartSensitivity
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -108,6 +108,7 @@ CUSTOMER: {customer_name}
 SERVICE INFO:
 {service_info}
 SHOWROOM: {showroom}
+TODAY (say the words; the date in brackets is only for tools): {today}
 
 HOW YOU TALK: a polite, warm young woman from the showroom on a phone call, in
 respectful SPOKEN Tamil (as people in Thoothukudi talk) with everyday English
@@ -116,7 +117,10 @@ words: bike, service, free, date, okay, confirm. Simple, clear words, no slang:
 (சரிங்க, ஆமாங்க, நன்றிங்க). Calm, clear, unhurried. Each reply: one or two short
 COMPLETE sentences that end properly, one question at a time. Begin with a gentle
 acknowledgement when it fits (சரிங்க, ஓகேங்க, புரியுதுங்க, பரவாயில்லங்க), varied;
-never repeat a line word for word. Keep this style whatever language they use.
+never repeat a line word for word, and never re-say what you already said (bike,
+service, date) unless asked. Interrupted: stop, answer what they said, don't
+start over. Calling a tool: don't talk first; after it, just continue. Keep
+this style whatever language they use.
 You have no name: you're "Arul Motors Yamaha showroom, Nazareth". No sir/madam.
 Say dates clearly with day, date and month ("இந்த Saturday, October 25-ஆம் தேதி");
 never IDs, YYYY-MM-DD or symbols; registrations slowly, one character at a time.
@@ -129,8 +133,8 @@ SOUND LIKE THIS:
 
 FLOW:
 1. Confirm it's {customer_name}. Wrong person: "மன்னிக்கணும்ங்க, தவறா call வந்துருச்சு", log wrong_number, end.
-2. get_current_datetime once; reuse its dates, never guess. Say the bike, the
-   service type by name, if it's free, and when it's due.
+2. Dates come from TODAY above; never guess or call a tool for them. Say the
+   bike, the service type by name, if it's free, and when it's due.
 3. Ask which date; turn "Saturday"/"next Monday" into the exact date, confirm with the day.
 4. Agreed: create_service_appointment, then clearly say the day, date and service
    type they're coming for.
@@ -198,10 +202,23 @@ def _service_info(customer: dict) -> str:
     return "\n".join(lines) or "- (none)"
 
 
+def _today_line() -> str:
+    """Today and the next 14 days at the showroom (IST), as the agent says them
+    plus the ISO date its tools take. In the prompt, not a tool: looking the
+    date up mid-reply made the agent talk, pause, then repeat itself. Calls
+    last minutes (MAX_CALL_SECS), so it can't go stale."""
+    now = database.now()
+    days = ", ".join(
+        f"{(now + timedelta(days=i)).strftime('%a %d %b')} ({(now + timedelta(days=i)).date().isoformat()})"
+        for i in range(1, 15)
+    )
+    return f"{now.strftime('%a %d %b %Y')} ({now.date().isoformat()}), {now.strftime('%H:%M')} IST. Next days: {days}"
+
+
 def build_system_instruction(customer: dict) -> str:
-    """Fill the system prompt with this call's customer, bikes, bookings and
-    the details of the service types involved. Kept short: Gemini Live
-    re-reads the whole prompt every turn."""
+    """Fill the system prompt with this call's customer, bikes, bookings, the
+    details of the service types involved, and today's dates. Kept short:
+    Gemini Live re-reads the whole prompt every turn."""
     vehicles = "\n".join(
         f"- {v['model']} {v['registration_number']}: {v['next_service_type']} due "
         f"{_say_date(v['next_service_date'])}; bought {_say_date(v['purchase_date'])}, "
@@ -220,6 +237,7 @@ def build_system_instruction(customer: dict) -> str:
     return SYSTEM_INSTRUCTION_TEMPLATE.format(
         location=database.SHOWROOM_LOCATION,
         showroom=SHOWROOM_FACTS,
+        today=_today_line(),
         customer_name=customer["name"],
         vehicles=vehicles,
         appointments=appointments,
@@ -432,7 +450,7 @@ TOOLS = ToolsSchema(
     standard_tools=[
         FunctionSchema(
             name="get_current_datetime",
-            description="Today (IST) and the next 14 dates.",
+            description="Today (IST) and the next 14 dates. Only if TODAY in your instructions isn't enough.",
             properties={},
             required=[],
         ),
@@ -588,27 +606,10 @@ class CallGuard(FrameProcessor):
         await self.push_frame(EndWorkerFrame(), FrameDirection.UPSTREAM)
 
 
-class FinishSentencesGeminiLive(GeminiLiveVertexLLMService):
-    """Gemini Live that always finishes what it's saying (no barge-in).
-
-    Listeners in Tamil say "ம்ம்", "சரி", "ஆமா" while the other person talks; with
-    Gemini's default (start of user speech interrupts) each one cut the agent
-    off mid-sentence and the rest of the reply was dropped. With NO_INTERRUPTION
-    the agent completes its (short) reply, then answers what the customer said.
-    Pipecat 1.12 has no setting for this, so it's added to the connect config.
-    """
-
-    async def _connection_task_handler(self, config):
-        if config.realtime_input_config is None:
-            config.realtime_input_config = RealtimeInputConfig()
-        config.realtime_input_config.activity_handling = ActivityHandling.NO_INTERRUPTION
-        await super()._connection_task_handler(config)
-
-
 def _build_llm(customer: dict) -> GeminiLiveVertexLLMService:
     # No credentials passed: Pipecat falls back to ADC (`gcloud auth
     # application-default login` locally, Workload Identity on a server).
-    return FinishSentencesGeminiLive(
+    return GeminiLiveVertexLLMService(
         project_id=GOOGLE_CLOUD_PROJECT,
         location=GOOGLE_CLOUD_LOCATION,
         tools=TOOLS,
@@ -630,14 +631,16 @@ def _build_llm(customer: dict) -> GeminiLiveVertexLLMService:
             ),
             # Turn-taking (Gemini's server-side VAD):
             # - LOW start sensitivity: background noise or the agent's own voice
-            #   echoing back isn't taken as the customer starting to speak.
-            #   (The agent is never cut off mid-reply: see FinishSentencesGeminiLive.)
+            #   echoing back no longer "interrupts" it mid-word; real speech still does.
+            # - 500 ms of speech before it counts as the customer starting to talk:
+            #   a quick "ம்ம்"/"சரி" while the agent speaks doesn't cut it off, but
+            #   a real interruption still stops it (300 ms cut it off on every "ம்ம்").
             # - 600 ms of silence ends the customer's turn: people pause
             #   mid-sentence, and 300 ms made the agent jump in too early.
             vad=GeminiVADParams(
                 start_sensitivity=StartSensitivity.START_SENSITIVITY_LOW,
                 end_sensitivity=EndSensitivity.END_SENSITIVITY_HIGH,
-                prefix_padding_ms=300,
+                prefix_padding_ms=500,
                 silence_duration_ms=600,
             ),
         ),

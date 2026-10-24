@@ -28,7 +28,7 @@ Credentials. There is no API key, because the Google Cloud org policy blocks the
 | Identity | Named assistant "EDITH" | No name: "Nazareth Arul Motors Yamaha showroom-ல இருந்து call பண்றோம்" |
 | What it books | Doctor, date **and time** | **Only the date** the customer will bring the bike in |
 | Appointments by voice | Book / reschedule / cancel | Full CRUD: create, check, update (date or notes), cancel |
-| Today's date | Tool | Always from `get_current_datetime` (showroom time, IST); never baked into the prompt |
+| Today's date | Prompt | Today and the next 14 dates (showroom time, IST) are filled in at call start; `get_current_datetime` is a fallback |
 | Context | Collects everything from the caller | Already knows the customer, bike, purchase date and due service (injected into the prompt per call) |
 | Tool scope | Any appointment, looked up by name and mobile | Bound to the one customer on the call |
 | Ending | Patient hangs up | Agent logs the call outcome, then hangs up (`end_call`) |
@@ -50,8 +50,8 @@ Credentials. There is no API key, because the Google Cloud org policy blocks the
 
 1. "வணக்கம்ங்க! Nazareth Arul Motors Yamaha showroom-ல இருந்து call பண்றோம், Karthik Raja தானே பேசறீங்க?"
    If it's the wrong person, the agent logs `wrong_number` and hangs up.
-2. Calls `get_current_datetime` so it knows today's date (IST) and the dates of
-   the coming days.
+2. Knows today's date (IST) and the dates of the coming days: they're filled
+   into its instructions when the call starts.
 3. Tells them their bike's service is due, e.g. the FZ-S Fi's first free service.
 4. Asks **when** they'll bring the bike in, date only. If they say "Saturday" or
    "next Monday", the agent works out the exact date from the datetime tool and

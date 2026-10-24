@@ -14,7 +14,7 @@ the bike in (date only, no time slots). That date is stored in SQLite.
 
 - Speaks natural Tanglish with everyday interjections. Has no personal name:
   "Nazareth Arul Motors Yamaha showroom-ல இருந்து call பண்றோம்".
-- Call flow: confirm it's the right customer → `get_current_datetime` (IST) →
+- Call flow: confirm it's the right customer → today's dates (IST, in the prompt) →
   service due → collect the date → log the outcome → goodbye and hang up.
 - Customers can create, check, update and cancel their appointments, and
   search past and upcoming bookings by voice. See `README.md` for tools and rules.
@@ -165,7 +165,12 @@ enabled:
 - No raw call audio is written to disk; only tool-captured structured outcomes are stored.
 - The agent never invents dates, service history or details not in the
   database. It asks for the date only; there are no time slots.
-- "Today" always comes from the `get_current_datetime` tool (IST), never from the prompt.
+- "Today" (IST) and the next 14 dates are put in the prompt at call start (`_today_line`), not
+  looked up mid-call: a mid-reply `get_current_datetime` call made the agent talk, pause and repeat
+  itself (changed 2026-10-24). The tool stays as a fallback. Calls are capped at 5 minutes.
+- Barge-in stays on (customers must be able to interrupt). `prefix_padding_ms=500` keeps a short
+  "ம்ம்"/"சரி" from cutting the agent off. Don't use `NO_INTERRUPTION`: the agent ignores real
+  interruptions and answers buffered echo/noise afterwards (it repeated itself).
 - Tools are bound to the customer on the call. Other customers' bookings are
   visible only with the full registration or mobile number, are read-only, and
   mobile numbers are never read out.
