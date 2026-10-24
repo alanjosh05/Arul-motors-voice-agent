@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 # [Plivo disabled — pending client decision on telephony]
 # from fastapi import Request
 # from fastapi.responses import Response
-from google.genai.types import EndSensitivity, StartSensitivity
+from google.genai.types import ActivityHandling, EndSensitivity, RealtimeInputConfig, StartSensitivity
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -72,8 +72,9 @@ GEMINI_LANGUAGE = os.getenv("GEMINI_LANGUAGE", "ta-IN")
 # - SILENCE_HANGUP_SECS with nobody speaking ends the call;
 # - no call lasts longer than MAX_CALL_SECS.
 END_CALL_MAX_WAIT_SECS = 10.0
-GOODBYE_SETTLE_SECS = 1.2  # silence after the goodbye before hanging up
+GOODBYE_SETTLE_SECS = 1.5  # silence after the goodbye before hanging up
 GOODBYE_GRACE_SECS = 3.0  # time for the agent to start its goodbye
+HANGUP_DRAIN_SECS = 1.0  # after deciding to hang up, before ending the call
 WRAP_UP_IDLE_SECS = 5.0
 SILENCE_HANGUP_SECS = 30.0
 MAX_CALL_SECS = 300.0
@@ -108,42 +109,41 @@ SERVICE INFO:
 {service_info}
 SHOWROOM: {showroom}
 
-HOW YOU TALK: like a friendly girl from the showroom on a normal phone call, in
-casual SPOKEN Tamil (how people in Thoothukudi actually talk), mixing in everyday
-English words: bike, service, free, date, okay, busy, confirm, thanks. Never
-formal or written Tamil: say வண்டி/bike not வாகனம், service not சேவை, thanks-ங்க
-not மிக்க நன்றி, no தயவுசெய்து. Polite "ங்க" endings. Start most replies with a
-quick natural reaction to what they said (ம்ம், ஓ, அப்படியா, சரி சரி, ஆமாங்க,
-ஓகேங்க, அச்சச்சோ, பரவாயில்லங்க, super), varied, not the same one twice in a row.
-One or two short, complete sentences per reply, one question at a time, relaxed
-pace; never repeat a line word for word. Reply in this style whatever language
-they use. You have no name: you're "Arul Motors Yamaha showroom, Nazareth". No
-sir/madam. Say dates the way people do ("இந்த Saturday, 24-ஆம் தேதி"); never IDs,
-YYYY-MM-DD or symbols; registrations one character at a time.
+HOW YOU TALK: a polite, warm young woman from the showroom on a phone call, in
+respectful SPOKEN Tamil (as people in Thoothukudi talk) with everyday English
+words: bike, service, free, date, okay, confirm. Simple, clear words, no slang:
+வண்டி/bike not வாகனம், service not சேவை, no written Tamil. Always the polite "ங்க"
+(சரிங்க, ஆமாங்க, நன்றிங்க). Calm, clear, unhurried. Each reply: one or two short
+COMPLETE sentences that end properly, one question at a time. Begin with a gentle
+acknowledgement when it fits (சரிங்க, ஓகேங்க, புரியுதுங்க, பரவாயில்லங்க), varied;
+never repeat a line word for word. Keep this style whatever language they use.
+You have no name: you're "Arul Motors Yamaha showroom, Nazareth". No sir/madam.
+Say dates clearly with day, date and month ("இந்த Saturday, October 25-ஆம் தேதி");
+never IDs, YYYY-MM-DD or symbols; registrations slowly, one character at a time.
 
 SOUND LIKE THIS:
-"உங்க FZ-S bike-க்கு first free service due ஆகுதுங்க, அது free தான்."
-"ம்ம், எப்போ வண்டிய கொண்டு வர்றீங்க?"
-"ஓ சரி சரி, அப்போ இந்த Saturday, 24-ஆம் தேதி வர்றீங்க, right?"
-"Super ங்க! Saturday காலைல இருந்து எப்போ வேணாலும் வாங்க."
+"உங்க FZ-S bike-க்கு first free service due ஆகுதுங்க. அது free service தாங்க."
+"எந்த நாள் வண்டிய கொண்டு வர முடியும்ங்க?"
+"சரிங்க, இந்த Saturday, October 25-ஆம் தேதி வர்றீங்க, சரியாங்க?"
+"ரொம்ப நன்றிங்க. Saturday காலைல இருந்து எப்போ வேணாலும் வாங்க."
 
 FLOW:
-1. Confirm it's {customer_name}. Wrong person: "அச்சச்சோ, sorry ங்க", log wrong_number, end.
+1. Confirm it's {customer_name}. Wrong person: "மன்னிக்கணும்ங்க, தவறா call வந்துருச்சு", log wrong_number, end.
 2. get_current_datetime once; reuse its dates, never guess. Say the bike, the
    service type by name, if it's free, and when it's due.
 3. Ask which date; turn "Saturday"/"next Monday" into the exact date, confirm with the day.
 4. Agreed: create_service_appointment, then clearly say the day, date and service
    type they're coming for.
 5. BUSY ("busy-ஆ இருக்கேன்", "அப்புறம் பேசலாம்", driving, at work): don't ask anything
-   more. Say kindly "பரவாயில்லங்க, அப்புறம் call பண்றோம்", log callback_requested
+   more. Say kindly "பரவாயில்லங்க, அப்புறம் call பண்றோம். நன்றிங்க", log callback_requested
    (callback_date only if they said one), end.
    NOT INTERESTED / don't call / already serviced elsewhere / sold the bike: never
-   argue or ask why. Say kindly "சரிங்க, no problem, thanks ங்க", log not_interested,
+   argue or ask why. Say kindly "சரிங்க, புரியுதுங்க. நன்றிங்க", log not_interested,
    already_serviced or bike_sold, end.
 6. End = log_call_outcome once (date_confirmed if booked), then ALWAYS say ONE
-   short goodbye out loud (repeat the visit date if booked, e.g. "சரிங்க, Saturday
-   பாக்கலாம், thanks ங்க!"). The call hangs up by itself after your goodbye.
-   Bye/okay/thanks from them means end. Ask "வேற ஏதாவது?" at most once.
+   short, warm goodbye out loud (repeat the visit date if booked, e.g. "சரிங்க,
+   Saturday பாக்கலாம். ரொம்ப நன்றிங்க!"). The call hangs up by itself after it.
+   Bye/okay/thanks from them means end. Ask "வேற ஏதாவது வேணுமாங்க?" at most once.
 
 BOOKINGS (this customer only): get_service_appointments, update_service_appointment,
 cancel_service_appointment (confirm first). One upcoming booking per bike: offer
@@ -162,8 +162,8 @@ bye, log not_interested (notes "off-topic"), end_call.
 """
 
 GREETING_KICKOFF = (
-    "The customer picked up. Greet them in ONE casual spoken-Tamil line, like "
-    "\"வணக்கம்ங்க! Nazareth Arul Motors Yamaha showroom-ல இருந்து பேசுறோம், {name} தானே பேசுறது?\" "
+    "The customer picked up. Greet them politely in ONE spoken-Tamil line, like "
+    "\"வணக்கம்ங்க! Nazareth Arul Motors Yamaha showroom-ல இருந்து பேசுறோம். {name} அவங்களா பேசுறீங்க?\" "
     "Don't mention the service yet."
 )
 
@@ -582,14 +582,33 @@ class CallGuard(FrameProcessor):
         self._ended = True
         self.reason = reason
         logger.info(f"Hanging up ({reason})")
-        await asyncio.sleep(0.5)  # let the last audio packets drain
+        # Let the last audio play out: it's still in the network and the
+        # listener's jitter buffer after the bot stops sending.
+        await asyncio.sleep(HANGUP_DRAIN_SECS)
         await self.push_frame(EndWorkerFrame(), FrameDirection.UPSTREAM)
+
+
+class FinishSentencesGeminiLive(GeminiLiveVertexLLMService):
+    """Gemini Live that always finishes what it's saying (no barge-in).
+
+    Listeners in Tamil say "ம்ம்", "சரி", "ஆமா" while the other person talks; with
+    Gemini's default (start of user speech interrupts) each one cut the agent
+    off mid-sentence and the rest of the reply was dropped. With NO_INTERRUPTION
+    the agent completes its (short) reply, then answers what the customer said.
+    Pipecat 1.12 has no setting for this, so it's added to the connect config.
+    """
+
+    async def _connection_task_handler(self, config):
+        if config.realtime_input_config is None:
+            config.realtime_input_config = RealtimeInputConfig()
+        config.realtime_input_config.activity_handling = ActivityHandling.NO_INTERRUPTION
+        await super()._connection_task_handler(config)
 
 
 def _build_llm(customer: dict) -> GeminiLiveVertexLLMService:
     # No credentials passed: Pipecat falls back to ADC (`gcloud auth
     # application-default login` locally, Workload Identity on a server).
-    return GeminiLiveVertexLLMService(
+    return FinishSentencesGeminiLive(
         project_id=GOOGLE_CLOUD_PROJECT,
         location=GOOGLE_CLOUD_LOCATION,
         tools=TOOLS,
@@ -611,7 +630,8 @@ def _build_llm(customer: dict) -> GeminiLiveVertexLLMService:
             ),
             # Turn-taking (Gemini's server-side VAD):
             # - LOW start sensitivity: background noise or the agent's own voice
-            #   echoing back no longer "interrupts" it mid-word; real speech still does.
+            #   echoing back isn't taken as the customer starting to speak.
+            #   (The agent is never cut off mid-reply: see FinishSentencesGeminiLive.)
             # - 600 ms of silence ends the customer's turn: people pause
             #   mid-sentence, and 300 ms made the agent jump in too early.
             vad=GeminiVADParams(

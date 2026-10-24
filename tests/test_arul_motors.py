@@ -995,3 +995,31 @@ def test_cors_exposes_download_file_names(db, monkeypatch):
     client = _api_client(monkeypatch)
     r = client.get("/api/admin/export.xlsx", headers={"Origin": "http://localhost:3000"})
     assert "content-disposition" in r.headers.get("access-control-expose-headers", "").lower()
+
+
+def test_agent_finishes_its_sentences(db):
+    """Customers' "ம்ம்"/"சரி" while the agent talks must not cut it off."""
+    import asyncio
+
+    import bot
+    from google.genai.types import ActivityHandling, LiveConnectConfig
+
+    seen = {}
+
+    async def fake_connect(self, config):
+        seen["config"] = config
+
+    original = bot.GeminiLiveVertexLLMService._connection_task_handler
+    bot.GeminiLiveVertexLLMService._connection_task_handler = fake_connect
+    try:
+        llm = bot.FinishSentencesGeminiLive.__new__(bot.FinishSentencesGeminiLive)
+        asyncio.run(llm._connection_task_handler(LiveConnectConfig()))
+    finally:
+        bot.GeminiLiveVertexLLMService._connection_task_handler = original
+    assert seen["config"].realtime_input_config.activity_handling == ActivityHandling.NO_INTERRUPTION
+    assert isinstance(bot._build_llm(db.get_customer(1)), bot.FinishSentencesGeminiLive)
+
+    # Polite, clear tone in the prompt; no slang reactions.
+    prompt = bot.build_system_instruction(db.get_customer(1))
+    assert "polite" in prompt and "COMPLETE sentences" in prompt
+    assert "அச்சச்சோ" not in prompt and "Super" not in prompt
