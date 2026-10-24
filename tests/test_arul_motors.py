@@ -946,3 +946,52 @@ def test_admin_can_switch_the_voice_agent_off(db, monkeypatch):
     assert client.patch("/api/settings", json={"voice_agent_enabled": False}).status_code == 200
     assert client.patch("/api/settings", json={"voice_agent_enabled": True}).json() == {"voice_agent_enabled": True}
     assert db.voice_agent_enabled() is True
+
+
+def test_admin_excel_export_and_database_backup(db, monkeypatch, tmp_path):
+    import io
+    import sqlite3
+
+    from openpyxl import load_workbook
+
+    client = _api_client(monkeypatch)  # admin
+    db.update_customer(db.get_customer_by_mobile("9876543210")["id"], alternate_mobile="9840077777")
+    db.log_call(db.get_customer_by_mobile("9876543210")["id"], "callback_requested", callback_date=days_ahead(3))
+
+    # Excel: four sheets, a row per bike, mobiles as text, real dates.
+    r = client.get("/api/admin/export.xlsx")
+    assert r.status_code == 200 and "spreadsheetml" in r.headers["content-type"]
+    assert "attachment" in r.headers["content-disposition"]
+    wb = load_workbook(io.BytesIO(r.content))
+    assert wb.sheetnames == ["Customers & Bikes", "Bookings", "Calls", "Service Types"]
+    bikes = list(wb["Customers & Bikes"].iter_rows(values_only=True))
+    assert bikes[0][:3] == ("Customer", "Mobile", "Alternate mobile") and len(bikes) == 5
+    karthik = next(row for row in bikes if row[0] == "Karthik Raja")
+    assert karthik[1] == "9876543210" and karthik[2] == "9840077777"
+    assert hasattr(karthik[8], "year")  # next service due is a date cell
+    assert karthik[12] == "Call back"
+    assert len(list(wb["Calls"].iter_rows())) == 2
+    assert len(list(wb["Service Types"].iter_rows())) == 1 + len(db.list_service_types())
+
+    # Database copy: a valid SQLite file with the same data.
+    r = client.get("/api/admin/backup.db")
+    if db.using_mysql():
+        assert r.status_code == 400
+    else:
+        assert r.status_code == 200 and r.content[:16] == b"SQLite format 3\x00"
+        copy = tmp_path / "copy.db"
+        copy.write_bytes(r.content)
+        conn = sqlite3.connect(copy)
+        assert conn.execute("SELECT count(*) FROM customers").fetchone()[0] == 4
+        conn.close()
+
+    # Staff can't download either.
+    staff = _api_client(monkeypatch, admin=False)
+    assert staff.get("/api/admin/export.xlsx").status_code == 403
+    assert staff.get("/api/admin/backup.db").status_code == 403
+
+
+def test_cors_exposes_download_file_names(db, monkeypatch):
+    client = _api_client(monkeypatch)
+    r = client.get("/api/admin/export.xlsx", headers={"Origin": "http://localhost:3000"})
+    assert "content-disposition" in r.headers.get("access-control-expose-headers", "").lower()

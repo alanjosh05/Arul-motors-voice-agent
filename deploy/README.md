@@ -84,6 +84,10 @@ Then:
   - Real customers are added with `POST /api/vehicles`.
 - **Logs:** `journalctl -u arul-voice -f` and `journalctl -u arul-api -f`.
 - **Update the code later:** repeat the copy step and run `vm-setup.sh` again.
+- **Backups:** daily disk snapshots (14 days) plus a nightly copy of the database to
+  `gs://arulmotors-db-backups` (20:50 IST, 90 days, `arul-backup.timer`). Admins can also
+  download a copy or an Excel export in the CRM (Settings → Data & backups). Restore steps:
+  [GCP-LESSONS.md](GCP-LESSONS.md), Lesson 11.
   The database and `.env` are kept.
 
 ## 3. CRM frontend on GoDaddy

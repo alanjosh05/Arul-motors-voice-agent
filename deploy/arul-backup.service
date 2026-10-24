@@ -1,0 +1,10 @@
+[Unit]
+Description=Arul Motors: copy the CRM database to Cloud Storage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=arul
+EnvironmentFile=-/opt/arul-motors/.env
+ExecStart=/opt/arul-motors/backup-db.sh

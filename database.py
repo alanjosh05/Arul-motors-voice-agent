@@ -1750,6 +1750,25 @@ def _record_change(entities: list[str], customer_id: int | None = None) -> None:
     emit_event("data.changed", {"entities": entities, "customer_id": customer_id})
 
 
+def backup_bytes() -> bytes:
+    """A consistent copy of the SQLite database (safe while the bot and API
+    write: SQLite's online backup). For MySQL, use the host's own backups."""
+    if using_mysql():
+        raise RuntimeError("Database backups from the CRM are for SQLite only.")
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "backup.db")
+        source, target = sqlite3.connect(DB_FILE), sqlite3.connect(path)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        with open(path, "rb") as f:
+            return f.read()
+
+
 # ---------------------------------------------------------------------------
 # Settings (showroom-wide, changed by admins in the CRM)
 # ---------------------------------------------------------------------------

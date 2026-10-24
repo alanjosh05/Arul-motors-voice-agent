@@ -32,6 +32,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 import auth
+import crm_export
 import database
 
 # import dialer  # Plivo disabled — pending client decision on telephony
@@ -223,6 +224,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Lets the CRM (another domain) read download file names.
+    expose_headers=["Content-Disposition"],
 )
 
 # Public base URL of the Pipecat voice bot (browser test page).
@@ -746,6 +749,37 @@ def update_settings(body: SettingsPatch, user: dict = Depends(admin_user)):
 
 
 VOICE_OFF = "The voice agent is turned off. An admin can turn it on in Settings."
+
+
+# ---------------------------------------------------------------------------
+# Data downloads (admins): Excel export and a copy of the database
+# ---------------------------------------------------------------------------
+def _download(content: bytes, media_type: str, name: str) -> Response:
+    return Response(
+        content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"},
+    )
+
+
+@api.get("/admin/export.xlsx", dependencies=[Depends(admin_user)])
+def export_excel():
+    """The CRM as an Excel workbook (customers & bikes, bookings, calls, service types)."""
+    return _download(
+        crm_export.build_workbook(),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        f"arul-motors-crm-{database.today().isoformat()}.xlsx",
+    )
+
+
+@api.get("/admin/backup.db", dependencies=[Depends(admin_user)])
+def download_backup():
+    """A copy of the whole database (SQLite), for safekeeping or a restore."""
+    try:
+        content = database.backup_bytes()
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return _download(content, "application/vnd.sqlite3", f"arul-motors-backup-{database.today().isoformat()}.db")
 
 
 @api.get("/voice/config")

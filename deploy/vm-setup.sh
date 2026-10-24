@@ -32,6 +32,7 @@ fi
 id arul >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin arul
 mkdir -p "$APP"
 cp "$SRC/bot.py" "$SRC/database.py" "$SRC/api.py" "$SRC/auth.py" "$SRC/requirements.txt" "$APP/"
+install -m 755 "$SRC/deploy/backup-db.sh" "$APP/backup-db.sh"
 if [ ! -f "$APP/.env" ]; then
   cat > "$APP/.env" <<ENV
 # Signs CRM staff logins. Changing it signs everyone out.
@@ -66,6 +67,11 @@ systemctl daemon-reload
 systemctl enable arul-voice arul-api
 systemctl restart arul-voice arul-api
 
+# Nightly database copy to Cloud Storage (20:50 IST, before the 21:00 stop).
+cp "$SRC/deploy/arul-backup.service" "$SRC/deploy/arul-backup.timer" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now arul-backup.timer
+
 # Caddy: HTTPS for both domains, basic auth on the voice page.
 if ! grep -q "$VOICE_DOMAIN" /etc/caddy/Caddyfile 2>/dev/null; then
   read -rp "Username for the voice page: " VOICE_USER
@@ -83,3 +89,4 @@ echo "  API:        https://$API_DOMAIN/api/health"
 echo "  CRM login:  create the first admin (once):"
 echo "              cd $APP && sudo -u arul .venv/bin/python api.py create-user admin --role admin --name \"Your Name\""
 echo "  Logs:       journalctl -u arul-voice -f   /   journalctl -u arul-api -f"
+echo "  Backups:    nightly 20:50 IST to gs://arulmotors-db-backups (test now: sudo systemctl start arul-backup && journalctl -u arul-backup -n 5)"

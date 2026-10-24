@@ -92,6 +92,7 @@ account) or create the planned `arul-voice` VM. A static IP can be
 - [ ] **Lesson 8:** Costs
 - [ ] **Lesson 9:** Real deployment of Arul Motors
 - [x] **Lesson 10:** Instance schedule (VM off at night to save cost). 2026-10-23
+- [x] **Lesson 11:** Database backups: Cloud Storage off-site copy, CRM downloads, restore. 2026-10-24
 
 ---
 
@@ -1292,6 +1293,112 @@ console; it stops again at the next 21:00.
   re-attach needed). First automatic start due 24 Oct 07:00 IST.
 - Same day: stop moved to **21:00** (`--vm-stop-schedule="0 21 * * *"`).
 - First automatic stop / start seen: (check the next morning)
+
+---
+
+## Lesson 11: Database backups (off-site copy, CRM downloads, restore)
+
+**AWS equivalent:** an S3 bucket in another region + a cron job uploading
+`sqlite3 .backup` copies, with a lifecycle rule; IAM `s3:PutObject` only.
+
+All CRM data is one SQLite file: `/opt/arul-motors/arul_motors.db`.
+
+### Three layers
+
+| Layer | What | Kept | Protects against |
+|---|---|---|---|
+| Disk snapshot (Lesson 6) | Whole disk, daily 03:30 IST | 14 days | VM / disk broken, bad update |
+| **Cloud Storage copy** | `arul_motors.db`, daily **20:50 IST** | **90 days** (+7 days soft delete) | Mistakes noticed late, project or region problems |
+| **CRM download** (admins) | Settings → **Data & backups** | Wherever you save it | Owner keeps a copy outside GCP; before risky changes |
+
+Plus **Export to Excel** in the same tab (Customers & Bikes, Bookings, Calls,
+Service Types) for the showroom to work on. Excel edits don't flow back.
+
+### What was set up (2026-10-24)
+
+- Bucket **`gs://arulmotors-db-backups`** in **asia-south2 (Delhi)**, a different
+  region from the VM; Standard class; uniform access; **public access
+  prevention enforced**; lifecycle **delete after 90 days**; label `app=arulmotors`;
+  soft delete 7 days (Google's default).
+- The VM's service account `arul-voice-agent@…` has **Storage Object Creator on
+  this bucket only**: it can add backups but can't read, overwrite or delete them.
+- On the VM (`vm-setup.sh` installs it): `/opt/arul-motors/backup-db.sh` +
+  `arul-backup.timer` (20:50 Asia/Kolkata, `Persistent=true` so a missed run
+  happens at the next boot). The script: `sqlite3 .backup` → `PRAGMA
+  integrity_check` → gzip → upload `daily/arul_motors_YYYY-MM-DD_HHMM.db.gz`
+  with a token from the metadata server (no keys). About 8 KB a night today.
+
+```bash
+# what was run (from the Mac)
+gcloud storage buckets create gs://arulmotors-db-backups --location=asia-south2 \
+  --default-storage-class=STANDARD --uniform-bucket-level-access --public-access-prevention
+gcloud storage buckets update gs://arulmotors-db-backups --lifecycle-file=lifecycle.json \
+  --update-labels=app=arulmotors      # {"rule":[{"action":{"type":"Delete"},"condition":{"age":90}}]}
+gcloud storage buckets add-iam-policy-binding gs://arulmotors-db-backups \
+  --member=serviceAccount:arul-voice-agent@project-2c317546-b2c6-4a7a-8d4.iam.gserviceaccount.com \
+  --role=roles/storage.objectCreator
+```
+
+### Console
+
+- **Cloud Storage → Buckets → arulmotors-db-backups → Objects → daily/**: the
+  nightly files. **Lifecycle** and **Permissions** tabs show the rules above.
+
+### Check it works (on the VM, after `vm-setup.sh`)
+
+```bash
+systemctl list-timers arul-backup.timer          # next run 20:50 IST
+sudo systemctl start arul-backup                 # run one now
+journalctl -u arul-backup -n 5 --no-pager        # "Uploaded gs://…/daily/… (8.0K, 23 customers)"
+```
+
+From the Mac: `gcloud storage ls -l gs://arulmotors-db-backups/daily/`
+
+### Restore (from a Cloud Storage copy)
+
+The VM can't read the bucket (by design), so download on the Mac or in Cloud Shell:
+
+```bash
+gcloud storage ls gs://arulmotors-db-backups/daily/                   # pick a date
+gcloud storage cp gs://arulmotors-db-backups/daily/arul_motors_2026-10-24_2050.db.gz .
+gunzip arul_motors_2026-10-24_2050.db.gz
+sqlite3 arul_motors_2026-10-24_2050.db "PRAGMA integrity_check; SELECT count(*) FROM customers;"
+gcloud compute scp arul_motors_2026-10-24_2050.db arulmotors:~/restore.db --zone=asia-south1-c
+```
+
+Then on the VM:
+
+```bash
+sudo systemctl stop arul-api arul-voice
+cd /opt/arul-motors
+sudo mv arul_motors.db before-restore-$(date +%F).db
+sudo rm -f arul_motors.db-wal arul_motors.db-shm
+sudo mv ~/restore.db arul_motors.db && sudo chown arul:arul arul_motors.db
+sudo systemctl start arul-api arul-voice
+```
+
+A file from **Download backup** in the CRM restores the same way (skip gunzip).
+
+### Restore drill (do once, then every few months)
+
+Download the latest copy (above), run the `integrity_check` / `count(*)` line,
+and open it in a local CRM: `DB_FILE=$PWD/that.db python api.py`. If the
+customers are there, the backups work. A backup never restored is a hope.
+
+### Cost
+
+A few MB for 90 days of copies: well under ₹5/month.
+
+### Remember
+
+- Snapshots back up the disk; the bucket copy is off-site and longer.
+- The VM can only **create** in the bucket; restores are done by you.
+- Always restore with the services **stopped**, and keep the replaced file.
+
+### What happened (fill in)
+
+- First automatic upload seen:
+- Restore drill done:
 
 ---
 
