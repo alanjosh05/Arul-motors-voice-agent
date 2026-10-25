@@ -157,6 +157,10 @@ def _connect():
     # safe with WAL and avoids an fsync on every commit.
     conn = sqlite3.connect(DB_FILE, timeout=10)
     conn.execute("PRAGMA synchronous=NORMAL")
+    # Reads go through the OS page cache via mmap (shared by the bot and API
+    # and kept between these short-lived connections); temp tables in memory.
+    conn.execute("PRAGMA mmap_size=134217728")  # 128 MB
+    conn.execute("PRAGMA temp_store=MEMORY")
     conn.row_factory = sqlite3.Row
     return conn
 

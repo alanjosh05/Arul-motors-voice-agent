@@ -369,7 +369,33 @@ bookings:
 - **Live feed.** When no browser is connected, the event loop only tracks
   the latest id.
 - **SQLite tuning.** WAL is set once (it's stored in the file), plus
-  `synchronous=NORMAL` and a 10 s lock wait.
+  `synchronous=NORMAL`, a 10 s lock wait, `mmap_size` (reads through the OS
+  page cache, shared by the bot and API across their short-lived connections)
+  and `temp_store=MEMORY`.
+- **Compression at the edge.** Caddy `encode zstd gzip` on both sites (the voice
+  page's scripts went out uncompressed before). HTTP/2 and HTTP/3 are on.
+
+### Where the latency actually is (measured 2026-10-25)
+
+Every API endpoint answers in **~5 ms** on the VM (load 0.04, ~1.2 GB RAM
+free); a request from India takes **~100–220 ms** end to end, almost all of it
+network and TLS. So the CRM saves **round trips**, not server time:
+
+| Technique | Where | Effect |
+|---|---|---|
+| Browser cache for the app's files | `frontend/public/.htaccess` (GoDaddy Apache) | `/_next/static/*` cached 1 year (`immutable`, names change each build); pages `no-cache` (quick 304); deflate on text |
+| Preconnect to the API | `app/layout.tsx` | DNS + TLS to `backend.` (~170 ms) happen while the page loads |
+| Stale-while-revalidate across reloads | `components/providers.tsx` (React Query persister) | Pages open instantly with the last data (≤ 12 h, cleared at sign-out, dropped by each new build), then refresh |
+| Prefetching | `prefetchAllPages` after sign-in (when idle), `prefetchPage` on sidebar hover | Moving between pages shows data at once |
+| Optimistic updates with rollback | `lib/queries.ts` (`patchLists`) | Cancel booking, delete customer/bike/type, reorder or edit a service type, voice switch: the screen changes on click and is undone if the server refuses |
+| Live invalidation | WebSocket feed | No polling; only changed lists refetch |
+
+**No load balancer, on purpose.** Each request costs ~5 ms of one small VM,
+at most two staff use the CRM at once, and SQLite is one file on one disk.
+A load balancer (and a second VM + a database server) would add cost
+(₹1,500+/month) and a network hop to every request, not speed. It becomes
+worth it with many concurrent users or a need for zero-downtime upgrades;
+the path is below.
 - **Login throttle.** 10 failed sign-ins per client per 15 minutes → `429`.
 - **Missed-booking alerts** only cover the last 7 days, so a first run
   doesn't flood the bell.

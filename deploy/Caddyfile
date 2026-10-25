@@ -4,6 +4,8 @@
 # Voice agent. Basic auth keeps strangers from opening the voice page and
 # running up Gemini charges. Make the hash with:  caddy hash-password
 VOICE_DOMAIN {
+	# Compress the voice page's scripts (~1 MB of JS) and API replies.
+	encode zstd gzip
 	basic_auth {
 		VOICE_USER VOICE_PASSWORD_HASH
 	}
@@ -13,5 +15,6 @@ VOICE_DOMAIN {
 # Dashboard API, called by the frontend on GoDaddy. Protected by API_KEY
 # (X-API-Key header) and CORS_ORIGINS in the app itself.
 API_DOMAIN {
+	encode zstd gzip
 	reverse_proxy 127.0.0.1:8001
 }

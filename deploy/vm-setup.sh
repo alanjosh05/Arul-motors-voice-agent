@@ -81,6 +81,11 @@ if ! grep -q "$VOICE_DOMAIN" /etc/caddy/Caddyfile 2>/dev/null; then
       -e "s#VOICE_USER#$VOICE_USER#" -e "s#VOICE_PASSWORD_HASH#$HASH#" \
     "$SRC/deploy/Caddyfile" > /etc/caddy/Caddyfile
 fi
+# Installs from before compression was added: add it once to each site.
+if ! grep -q "encode zstd gzip" /etc/caddy/Caddyfile; then
+  sed -i -E "s/^(${VOICE_DOMAIN//./\\.}|${API_DOMAIN//./\\.}) \{$/\1 {\n\tencode zstd gzip/" /etc/caddy/Caddyfile
+fi
+caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
 systemctl reload caddy || systemctl restart caddy
 
 echo

@@ -93,7 +93,7 @@ class JobCard(BaseModel):
 
 PROMPT = """Scanned Yamaha job card (Arul Motors), partly handwritten. Fill only what is
 written, circled or ticked; blank or unreadable = null or []. Never guess.
-Dates: DD/MM/YY on the card -> YYYY-MM-DD. Amounts: whole rupees. A total written on
+Dates: DD/MM/YY on the card. Amounts: whole rupees. A total written on
 its own is total_amount, not a part. Copy part, frame and registration numbers exactly.
 jobs_done: map written jobs to the allowed values (Oil change -> Engine oil change).
 customer_requests: the CUSTOMER DEMANDED lines. Ignore signatures and stamps."""
