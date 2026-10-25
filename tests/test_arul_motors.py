@@ -1377,3 +1377,21 @@ def test_delete_a_closed_service_reopens_its_booking_and_restores_the_bike(db, m
     for column in db.BIKE_STATE:
         assert after[column] == before[column], column
     assert admin.delete(f"/api/service-records/{rid}").status_code == 404
+
+
+def test_dashboard_lists_upcoming_bookings_and_recent_services(db, monkeypatch):
+    import json
+
+    client = _api_client(monkeypatch, admin=False)
+    today_id = client.post("/api/appointments", json={"customer_id": 1, "appointment_date": days_ahead(0)}).json()["id"]
+    later = client.post("/api/appointments", json={"customer_id": 2, "appointment_date": days_ahead(3)}).json()["id"]
+    form = {"service_date": days_ahead(0), "jobs_done": json.dumps(["Water wash"]), "job_card_no": "9001"}
+    rid = client.post(f"/api/appointments/{today_id}/close", data=form,
+                      files={"report": ("a.pdf", PDF, "application/pdf")}).json()["id"]
+    stats = client.get("/api/stats").json()
+    assert later in [a["id"] for a in stats["upcoming_list"]]
+    assert all(a["appointment_date"] > days_ahead(0) for a in stats["upcoming_list"])
+    top = stats["recent_services"][0]
+    assert (top["kind"], top["id"], top["job_card_no"], top["customer_id"]) == ("record", rid, "9001", 1)
+    dates = [r["service_date"] for r in stats["recent_services"]]
+    assert dates == sorted(dates, reverse=True) and len(dates) <= 8

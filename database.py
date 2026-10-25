@@ -2070,6 +2070,33 @@ def get_dashboard_stats() -> dict:
         (day,),
     )
     upcoming = [_plain(r) for r in cursor.fetchall()]
+    # Latest services done: job card records, plus completed bookings without
+    # one (older services, e.g. from the client's import).
+    cursor.execute(
+        """
+    SELECT r.id, r.appointment_id, r.customer_id, r.vehicle_id, r.service_date, r.service_type, r.job_type,
+           r.job_card_no, r.amount, r.odometer_km, c.name AS customer_name, v.model, v.registration_number,
+           'record' AS kind
+    FROM service_records r
+    JOIN customers c ON c.id = r.customer_id
+    JOIN vehicles v ON v.id = r.vehicle_id
+    ORDER BY r.service_date DESC, r.id DESC LIMIT 8
+    """
+    )
+    done = [_plain(r) for r in cursor.fetchall()]
+    cursor.execute(
+        """
+    SELECT a.id AS appointment_id, a.customer_id, a.vehicle_id, a.appointment_date AS service_date, a.service_type,
+           c.name AS customer_name, v.model, v.registration_number, 'booking' AS kind
+    FROM service_appointments a
+    JOIN customers c ON c.id = a.customer_id
+    JOIN vehicles v ON v.id = a.vehicle_id
+    WHERE a.status = 'COMPLETED' AND NOT EXISTS (SELECT 1 FROM service_records r WHERE r.appointment_id = a.id)
+    ORDER BY a.appointment_date DESC LIMIT 8
+    """
+    )
+    done += [_plain(r) for r in cursor.fetchall()]
+    done.sort(key=lambda r: (r["service_date"], r.get("id") or 0), reverse=True)
     conn.close()
 
     calls_30 = get_call_logs(since_utc=_ist_day_start_utc(month_ago_day))
@@ -2113,6 +2140,8 @@ def get_dashboard_stats() -> dict:
         ],
         "todays_appointments": [a for a in upcoming if a["appointment_date"] == day],
         "due_services": due[:8],
+        "upcoming_list": [a for a in upcoming if a["appointment_date"] > day][:10],  # after today
+        "recent_services": done[:8],
         "recent_calls": calls_30[:6] if len(calls_30) >= 6 else get_call_logs(limit=6),
     }
 
