@@ -503,6 +503,7 @@ class ServiceTypeIn(BaseModel):
     interval_days: int | None = None
     interval_km: int | None = None
     price: int | None = None
+    overdue_days: int | None = None  # days after the due date before it's overdue
     active: bool = True
 
 
@@ -513,6 +514,7 @@ class ServiceTypePatch(BaseModel):
     interval_days: int | None = None
     interval_km: int | None = None
     price: int | None = None
+    overdue_days: int | None = None
     active: bool | None = None
 
 

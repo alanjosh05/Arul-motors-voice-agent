@@ -159,10 +159,10 @@ def build_workbook() -> bytes:
 
     _sheet(wb, "Service Types", [
         ("Service", 26, None), ("Free?", 7, None), ("Due after (days)", 15, None), ("Due after (km)", 14, "#,##0"),
-        ("Price (₹)", 10, "#,##0"), ("Active", 8, None), ("Description", 50, None),
+        ("Price (₹)", 10, "#,##0"), ("Overdue after (days)", 18, None), ("Active", 8, None), ("Description", 50, None),
     ], [
         [t["name"], "Yes" if t["is_free"] else "No", t["interval_days"], t["interval_km"], t["price"],
-         "Yes" if t["active"] else "No", t["description"] or ""]
+         t["overdue_days"], "Yes" if t["active"] else "No", t["description"] or ""]
         for t in database.list_service_types()
     ])
 

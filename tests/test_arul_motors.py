@@ -1152,3 +1152,29 @@ def test_close_service_with_job_card_moves_bike_on_and_keeps_history(db, monkeyp
     # Deleting the bike removes its records and PDFs.
     assert db.delete_vehicle(bike["id"])[0]
     assert db.get_service_document(record_id) is None and db.list_service_records() == []
+
+
+def test_service_type_overdue_days_decide_when_a_bike_is_overdue(db, monkeypatch):
+    """Each service type has its own overdue days: a bike due 10 days ago is
+    still 'due' for a 30-day type, but overdue for a 5-day (or 0-day) type."""
+    client = _api_client(monkeypatch)
+    r = client.post("/api/service-types", json={"name": "Grace 30", "interval_days": 60, "overdue_days": 30})
+    assert r.status_code == 201
+    grace30 = r.json()["id"]
+    assert client.post("/api/service-types", json={"name": "Grace 5", "interval_days": 60, "overdue_days": 5}).status_code == 201
+    assert client.post("/api/service-types", json={"name": "Bad", "overdue_days": -1}).status_code == 400
+    assert next(t for t in client.get("/api/service-types").json() if t["id"] == grace30)["overdue_days"] == 30
+
+    karthik, priya = db.get_customer(1)["vehicles"][0], db.get_customer(2)["vehicles"][0]
+    db.update_vehicle(karthik["id"], next_service_date=days_ahead(-10), next_service_type="Grace 30")
+    db.update_vehicle(priya["id"], next_service_date=days_ahead(-10), next_service_type="Grace 5")
+    due = {d["vehicle_id"]: d for d in client.get("/api/due-services", params={"days": 7}).json()}
+    assert due[karthik["id"]]["is_overdue"] is False and due[karthik["id"]]["overdue_from"] == days_ahead(20)
+    assert due[priya["id"]]["is_overdue"] is True and due[priya["id"]]["overdue_from"] == days_ahead(-5)
+    overdue_before = client.get("/api/stats").json()["totals"]["overdue"]
+
+    # Changing the type's overdue days changes the answer; empty means 0.
+    assert client.patch(f"/api/service-types/{grace30}", json={"overdue_days": None}).status_code == 200
+    due = {d["vehicle_id"]: d for d in client.get("/api/due-services", params={"days": 7}).json()}
+    assert due[karthik["id"]]["is_overdue"] is True and due[karthik["id"]]["overdue_days"] == 0
+    assert client.get("/api/stats").json()["totals"]["overdue"] == overdue_before + 1

@@ -342,11 +342,14 @@ def init_db():
         interval_days INTEGER,
         interval_km INTEGER,
         price INTEGER,
+        overdue_days INTEGER,
         sort_order INTEGER NOT NULL DEFAULT 0,
         active INTEGER NOT NULL DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) {t['table']}
     """)
+    # Days after the due date before this type counts as overdue (empty = 0).
+    _ensure_column(cursor, "service_types", "overdue_days", "INTEGER")
     cursor.execute("SELECT count(*) AS n FROM service_types")
     if cursor.fetchone()["n"] == 0:
         for order, (name, description, is_free, days, km) in enumerate(DEFAULT_SERVICE_TYPES, start=1):
@@ -664,8 +667,29 @@ def get_due_services(within_days: int = 7) -> list:
         (cutoff,),
     )
     rows = [_plain(r) for r in cursor.fetchall()]
+    grace = _overdue_days_by_type(cursor)
     conn.close()
+    for row in rows:
+        row.update(_overdue_info(row["next_service_date"], grace.get(row["next_service_type"], 0)))
     return rows
+
+
+def _overdue_days_by_type(cursor) -> dict[str, int]:
+    """Service type name -> days after the due date before it's overdue."""
+    cursor.execute("SELECT name, overdue_days FROM service_types")
+    return {r["name"]: r["overdue_days"] or 0 for r in cursor.fetchall()}
+
+
+def _overdue_info(next_service_date: str, overdue_days: int) -> dict:
+    """When a due service becomes overdue (due date + the type's overdue days)
+    and whether it is now."""
+    due = date.fromisoformat(next_service_date)
+    overdue_from = due + timedelta(days=overdue_days)
+    return {
+        "overdue_days": overdue_days,
+        "overdue_from": overdue_from.isoformat(),
+        "is_overdue": today() > overdue_from,
+    }
 
 
 def add_customer_vehicle(
@@ -1832,7 +1856,7 @@ def get_dashboard_stats() -> dict:
             "customers": customers,
             "vehicles": vehicles,
             "due_this_week": len(due),
-            "overdue": sum(1 for d in due if d["next_service_date"] < day),
+            "overdue": sum(1 for d in due if d["is_overdue"]),  # past each type's overdue days
             "upcoming_appointments": len(upcoming),
             "appointments_today": upcoming_by_day.get(day, 0),
             "completed_this_month": completed_this_month,
@@ -1857,7 +1881,9 @@ def get_dashboard_stats() -> dict:
 # ---------------------------------------------------------------------------
 # Service types (managed from the CRM)
 # ---------------------------------------------------------------------------
-SERVICE_TYPE_FIELDS = ("name", "description", "is_free", "interval_days", "interval_km", "price", "active")
+SERVICE_TYPE_FIELDS = (
+    "name", "description", "is_free", "interval_days", "interval_km", "price", "overdue_days", "active",
+)
 
 
 def _service_type_row(row) -> dict:
@@ -1893,7 +1919,7 @@ def _clean_service_type(fields: dict) -> tuple[dict, str | None]:
             return clean, "Enter a name."
         if len(clean["name"]) > 80:
             return clean, "Keep the name under 80 characters."
-    for key in ("interval_days", "interval_km", "price"):
+    for key in ("interval_days", "interval_km", "price", "overdue_days"):
         if key in clean and clean[key] is not None:
             try:
                 clean[key] = int(clean[key])
