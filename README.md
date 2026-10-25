@@ -156,9 +156,14 @@ booking இருக்கா?". Every filter is optional and they combine:
   number. Otherwise the agent is told matches are hidden and asks for one.
   Mobile numbers are never read back. Search is read-only for other
   customers' bookings.
-- **Maintenance records:** booking → service → **Close service** (CRM). Staff
-  record the service date, service done, odometer, work done (plus optional
-  parts, amount, technician, remarks) and upload the **service report PDF**
+- **Maintenance records:** booking → service → **Close service** (CRM), with the
+  fields of Arul Motors' Yamaha **job card**: job card no., type of job (free /
+  paid / accidental / quick repair / warranty), service, received and delivered
+  dates, odometer, frame and engine no. (also saved on the bike), customer
+  requests, jobs done (checklist) and other work, a **parts** table (part no.,
+  name, qty, ₹, warranty) and **labour** table with totals computed by the
+  server (warranty parts not charged), delivery checks, customer feedback,
+  bay/technician, mechanic, supervisor, remarks, and the **scanned job card PDF**
   (required, ≤ 10 MB). `POST /api/appointments/{id}/close` (multipart) saves a
   `service_records` row and the PDF as a BLOB in `service_documents`, marks the
   booking `COMPLETED`, and moves the bike on (last service date, odometer, next

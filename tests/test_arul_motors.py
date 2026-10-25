@@ -1051,31 +1051,53 @@ def test_cancel_removes_the_call_that_booked_it(db):
 PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 
 
-def test_close_service_with_report_moves_bike_on_and_keeps_history(db, monkeypatch):
-    """Book -> close the service (details + PDF) -> bike moves to its next
-    service; the record and PDF show in the bike's history."""
+def test_close_service_with_job_card_moves_bike_on_and_keeps_history(db, monkeypatch):
+    """Book -> close with the job card (fields + scanned PDF) -> bike moves to
+    its next service; the record and PDF show in the bike's history. Uses the
+    fields of Arul Motors' Yamaha job card."""
+    import json
+
     client = _api_client(monkeypatch, admin=False)  # any staff can close services
     karthik = db.get_customer_by_mobile("9876543210")
     bike = karthik["vehicles"][0]
     aid = client.post("/api/appointments", json={"customer_id": karthik["id"], "appointment_date": days_ahead(1)}).json()["id"]
     today = db.today().isoformat()
+    parts = [
+        {"part_no": "90793-AD411", "name": "Engine oil", "qty": 1, "amount": 737},
+        {"part_no": "388-E3440-01", "name": "Oil cleaner", "qty": 1, "amount": 265},
+        {"part_no": "90793AD8", "name": "Chain clean", "qty": 1, "amount": 194},
+        {"name": "Brake shoe", "qty": 2, "amount": 300, "warranty": True},  # not charged
+    ]
     form = {
-        "service_date": today, "service_type": "First free service", "odometer_km": "1180",
-        "work_done": "Oil change, chain lube, brake adjust", "parts": "Oil filter", "amount": "0",
-        "technician": "Ravi", "remarks": "Rear brake noise checked",
-        "next_service_date": days_ahead(90), "next_service_type": "Second free service",
+        "service_date": today, "received_date": today, "service_type": "First free service",
+        "job_type": "Free service", "job_card_no": "6862", "odometer_km": "3158",
+        "frame_number": "ME1RG3719S0016932", "engine_number": "G3E8E0123456",
+        "customer_requests": "Oil change, general checkup, water wash, brake and air check",
+        "jobs_done": json.dumps(["Engine oil change", "Water wash", "General check-up", "Chain lube"]),
+        "parts": json.dumps(parts),
+        "labour": json.dumps([{"description": "General service labour", "amount": 0}]),
+        "delivery_checks": json.dumps(["Customer demanded jobs done", "Final inspection done"]),
+        "feedback": json.dumps({"rating": "Very good", "delivery_on_time": True, "washing_quality": True}),
+        "technician": "Bay 2 / Ravi", "mechanic": "Kumar", "supervisor": "Selvam",
+        "remarks": "Rear tyre wear noted", "next_service_date": days_ahead(90), "next_service_type": "Second free service",
     }
-    pdf = {"report": ("Job card 12.pdf", PDF, "application/pdf")}
+    pdf = {"report": ("Job card 6862.pdf", PDF, "application/pdf")}
     url = f"/api/appointments/{aid}/close"
 
-    # Validation: PDF required and must be a PDF; no future dates; next after this one.
+    # Validation: PDF required and must be a PDF; dates; job type; table rows.
     assert client.post(url, data=form).status_code == 422  # no file at all
     assert client.post(url, data=form, files={"report": ("x.pdf", b"not a pdf", "application/pdf")}).status_code == 400
     big = b"%PDF" + b"0" * db.MAX_PDF_BYTES
     assert client.post(url, data=form, files={"report": ("big.pdf", big, "application/pdf")}).status_code == 400
     assert client.post(url, data={**form, "service_date": days_ahead(2)}, files=pdf).status_code == 400
+    assert client.post(url, data={**form, "received_date": days_ahead(1)}, files=pdf).status_code == 400
     assert client.post(url, data={**form, "next_service_date": today}, files=pdf).status_code == 400
-    assert client.post(url, data={**form, "work_done": " "}, files=pdf).status_code == 400
+    assert client.post(url, data={**form, "job_type": "Car wash"}, files=pdf).status_code == 400
+    assert client.post(url, data={**form, "parts": json.dumps([{"name": "", "qty": 1}])}, files=pdf).status_code == 400
+    assert client.post(url, data={**form, "parts": "not json"}, files=pdf).status_code == 400
+    assert client.post(url, data={**form, "feedback": json.dumps({"rating": "Wow"})}, files=pdf).status_code == 400
+    nothing = {**form, "jobs_done": "[]", "parts": "[]", "labour": "[]", "work_done": " "}
+    assert client.post(url, data=nothing, files=pdf).status_code == 400
     assert client.post("/api/appointments/AM9999/close", data=form, files=pdf).status_code == 404
     assert db.get_appointment(aid)["status"] == "CONFIRMED"  # nothing half-saved
 
@@ -1083,27 +1105,49 @@ def test_close_service_with_report_moves_bike_on_and_keeps_history(db, monkeypat
     assert r.status_code == 201, r.text
     record_id = r.json()["id"]
 
-    # Booking closed, bike moved on.
+    # Booking closed, bike moved on (and got its frame/engine numbers).
     assert db.get_appointment(aid)["status"] == "COMPLETED"
     v = next(x for x in db.get_customer(karthik["id"])["vehicles"] if x["id"] == bike["id"])
-    assert (v["last_service_date"], v["odometer_km"]) == (today, 1180)
+    assert (v["last_service_date"], v["odometer_km"]) == (today, 3158)
     assert (v["next_service_date"], v["next_service_type"]) == (days_ahead(90), "Second free service")
+    assert (v["frame_number"], v["engine_number"]) == ("ME1RG3719S0016932", "G3E8E0123456")
     assert client.post(url, data=form, files=pdf).status_code == 404  # can't close twice
 
-    # History under the bike, newest first, with the report.
+    # History: the job card's fields, totals computed by the server.
     history = client.get(f"/api/vehicles/{bike['id']}/service-history").json()
-    assert history[0]["kind"] == "record" and history[0]["work_done"].startswith("Oil change")
-    assert history[0]["document_name"] == "Job card 12.pdf" and history[0]["document_size"] == len(PDF)
-    assert history[0]["created_by"] == "Test staff"
+    rec = history[0]
+    assert rec["kind"] == "record" and rec["job_card_no"] == "6862" and rec["job_type"] == "Free service"
+    assert rec["parts_total"] == 1196 and rec["labour_total"] == 0 and rec["amount"] == 1196  # warranty part free
+    assert rec["jobs_done"] == ["Engine oil change", "Water wash", "General check-up", "Chain lube"]
+    assert rec["parts"][3]["warranty"] is True and rec["parts"][0]["part_no"] == "90793-AD411"
+    assert rec["feedback"] == {"rating": "Very good", "delivery_on_time": True, "washing_quality": True}
+    assert rec["delivery_checks"] == ["Customer demanded jobs done", "Final inspection done"]
+    assert (rec["technician"], rec["mechanic"], rec["supervisor"]) == ("Bay 2 / Ravi", "Kumar", "Selvam")
+    assert rec["document_name"] == "Job card 6862.pdf" and rec["document_size"] == len(PDF)
+    assert rec["created_by"] == "Test staff"
     report = client.get(f"/api/service-records/{record_id}/report")
     assert report.status_code == 200 and report.content == PDF
     assert report.headers["content-type"] == "application/pdf" and "inline" in report.headers["content-disposition"]
     assert client.get("/api/service-records/9999/report").status_code == 404
+    assert "Engine oil (90793-AD411) ×1 ₹737" in db.parts_summary(rec["parts"])
 
     # Older services without a record (e.g. imported) are listed too.
     priya = db.get_customer_by_mobile("9876501234")
     older = client.get(f"/api/vehicles/{priya['vehicles'][0]['id']}/service-history").json()
     assert older and older[0]["kind"] == "booking"
+
+    # The Excel export carries the job card fields.
+    from openpyxl import load_workbook
+    import io
+
+    admin = _api_client(monkeypatch)
+    sheet = load_workbook(io.BytesIO(admin.get("/api/admin/export.xlsx").content))["Service Records"]
+    row = dict(zip([c.value for c in sheet[1]], [c.value for c in sheet[2]]))
+    assert row["Job card"] == "6862" and row["Total ₹"] == 1196 and row["Feedback"] == "Very good"
+
+    # Frame/engine numbers can also be edited on the bike.
+    assert admin.patch(f"/api/vehicles/{bike['id']}", json={"frame_number": "ME1NEWFRAME0001"}).status_code == 200
+    assert db.get_customer(karthik["id"])["vehicles"][0]["frame_number"] == "ME1NEWFRAME0001"
 
     # Deleting the bike removes its records and PDFs.
     assert db.delete_vehicle(bike["id"])[0]

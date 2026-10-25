@@ -106,16 +106,31 @@ def build_workbook() -> bytes:
         ("Last call outcome", 17, None),
     ], bike_rows)
 
+    def yes_no(value):
+        return "" if value is None else ("Yes" if value else "No")
+
     _sheet(wb, "Service Records", [
-        ("Service date", 13, DAY), ("Customer", 24, None), ("Mobile", 13, "@"), ("Bike model", 30, None),
-        ("Registration", 15, None), ("Service", 22, None), ("Odometer (km)", 13, "#,##0"), ("Work done", 50, None),
-        ("Parts", 35, None), ("Amount (₹)", 11, "#,##0"), ("Technician", 16, None), ("Remarks", 35, None),
-        ("Next service", 13, DAY), ("Next service type", 22, None), ("Report PDF", 26, None), ("Closed by", 16, None),
+        ("Delivered", 12, DAY), ("Job card", 10, None), ("Customer", 22, None), ("Mobile", 13, "@"),
+        ("Bike model", 28, None), ("Registration", 15, None), ("Frame no.", 20, None), ("Engine no.", 16, None),
+        ("Type of job", 15, None), ("Service", 22, None), ("Received", 12, DAY), ("Odometer (km)", 13, "#,##0"),
+        ("Customer requests", 35, None), ("Jobs done", 45, None), ("Other work", 35, None), ("Parts", 55, None),
+        ("Parts ₹", 10, "#,##0"), ("Labour", 35, None), ("Labour ₹", 10, "#,##0"), ("Total ₹", 10, "#,##0"),
+        ("Delivery checks", 45, None), ("Feedback", 12, None), ("On time", 8, None), ("Washing OK", 10, None),
+        ("Staff OK", 9, None), ("Charges fair", 11, None), ("Repair OK", 10, None),
+        ("Technician", 15, None), ("Mechanic", 15, None), ("Supervisor", 15, None), ("Remarks", 35, None),
+        ("Next service", 12, DAY), ("Next service type", 22, None), ("Job card PDF", 24, None), ("Closed by", 15, None),
     ], [
-        [_day(r["service_date"]), r["customer_name"], r["mobile_number"], r["model"], r["registration_number"],
-         r["service_type"], r["odometer_km"], r["work_done"], r["parts"] or "", r["amount"], r["technician"] or "",
-         r["remarks"] or "", _day(r["next_service_date"]), r["next_service_type"] or "", r["document_name"] or "",
-         r["created_by"] or ""]
+        [_day(r["service_date"]), r["job_card_no"] or "", r["customer_name"], r["mobile_number"], r["model"],
+         r["registration_number"], r["frame_number"] or "", r["engine_number"] or "", r["job_type"] or "",
+         r["service_type"], _day(r["received_date"]), r["odometer_km"], r["customer_requests"] or "",
+         ", ".join(r["jobs_done"]), r["work_done"] or "", database.parts_summary(r["parts"]), r["parts_total"],
+         "; ".join(f"{x['description']} ₹{x['amount']}" for x in r["labour"]), r["labour_total"], r["amount"],
+         ", ".join(r["delivery_checks"]), r["feedback"].get("rating", ""),
+         yes_no(r["feedback"].get("delivery_on_time")), yes_no(r["feedback"].get("washing_quality")),
+         yes_no(r["feedback"].get("staff_behaviour")), yes_no(r["feedback"].get("fairness_of_charges")),
+         yes_no(r["feedback"].get("repairing_quality")),
+         r["technician"] or "", r["mechanic"] or "", r["supervisor"] or "", r["remarks"] or "",
+         _day(r["next_service_date"]), r["next_service_type"] or "", r["document_name"] or "", r["created_by"] or ""]
         for r in database.list_service_records()
     ])
 

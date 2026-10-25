@@ -376,13 +376,27 @@ def init_db():
         appointment_id {t['id']} UNIQUE,
         vehicle_id INTEGER NOT NULL,
         customer_id INTEGER NOT NULL,
+        job_card_no {t['str']},
+        job_type {t['str']},
+        received_date {t['day']},
         service_date {t['day']} NOT NULL,
         service_type {t['str']} NOT NULL,
         odometer_km INTEGER,
-        work_done TEXT NOT NULL,
+        frame_number {t['str']},
+        engine_number {t['str']},
+        customer_requests TEXT,
+        jobs_done TEXT,
+        work_done TEXT,
         parts TEXT,
+        labour TEXT,
+        parts_total INTEGER,
+        labour_total INTEGER,
         amount INTEGER,
+        delivery_checks TEXT,
+        feedback TEXT,
         technician {t['str']},
+        mechanic {t['str']},
+        supervisor {t['str']},
         remarks TEXT,
         next_service_date {t['day']},
         next_service_type {t['str']},
@@ -390,6 +404,9 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) {t['table']}
     """)
+    # Bikes: frame (chassis) and engine numbers, filled from the job card.
+    _ensure_column(cursor, "vehicles", "frame_number", t["str"])
+    _ensure_column(cursor, "vehicles", "engine_number", t["str"])
 
     # The service report PDF for each record, as a BLOB. A separate table so
     # lists and history never read the file; only "View PDF" does.
@@ -976,7 +993,13 @@ def complete_appointment(
 # ---------------------------------------------------------------------------
 # Maintenance records ("Close service")
 # ---------------------------------------------------------------------------
-MAX_PDF_BYTES = 10 * 1024 * 1024  # service report upload limit (10 MB)
+MAX_PDF_BYTES = 10 * 1024 * 1024  # job card / service report upload limit (10 MB)
+
+# From the Arul Motors Yamaha job card.
+JOB_TYPES = ["Free service", "Paid service", "Accidental", "Quick repair", "Warranty repair"]
+FEEDBACK_RATINGS = ["Excellent", "Very good", "Good", "Average", "Below expectation"]
+FEEDBACK_CHECKS = ["delivery_on_time", "washing_quality", "staff_behaviour", "fairness_of_charges", "repairing_quality"]
+_JSON_FIELDS = ("jobs_done", "parts", "labour", "delivery_checks", "feedback")
 
 
 def _clean_text(value: str | None, limit: int = 2000) -> str | None:
@@ -984,52 +1007,161 @@ def _clean_text(value: str | None, limit: int = 2000) -> str | None:
     return value[:limit] or None
 
 
-def close_service(
-    appointment_id: str,
-    *,
-    service_date: str | None,
-    service_type: str | None,
-    odometer_km: int | None,
-    work_done: str | None,
-    pdf: bytes | None,
-    pdf_name: str | None,
-    parts: str | None = None,
-    amount: int | None = None,
-    technician: str | None = None,
-    remarks: str | None = None,
-    next_service_date: str | None = None,
-    next_service_type: str | None = None,
-    actor: str | None = None,
-) -> tuple[bool, str, int | None]:
-    """Close a booking with what was done: saves a maintenance record and its
-    service report PDF, marks the booking COMPLETED, and moves the bike on
-    (last service date, odometer, next due service). All in one transaction.
-    Returns (ok, message, record_id)."""
-    day = normalize_date(service_date)
-    if not day:
-        return (False, "Enter the date the service was done.", None)
-    if day > today().isoformat():
-        return (False, "The service date can't be in the future.", None)
-    work_done = _clean_text(work_done)
-    if not work_done:
-        return (False, "Describe the work done.", None)
-    if odometer_km is not None and odometer_km < 0:
-        return (False, "Odometer must be 0 or more.", None)
-    if amount is not None and amount < 0:
-        return (False, "Amount must be 0 or more.", None)
-    if not pdf:
-        return (False, "Attach the service report (PDF).", None)
-    if len(pdf) > MAX_PDF_BYTES:
-        return (False, f"The PDF is larger than {MAX_PDF_BYTES // (1024 * 1024)} MB.", None)
-    if not pdf.startswith(b"%PDF"):
-        return (False, "The service report must be a PDF file.", None)
-    next_due = normalize_date(next_service_date) if next_service_date else None
-    if next_service_date and not next_due:
-        return (False, "Invalid next service date.", None)
-    if next_due and next_due <= day:
-        return (False, "The next service must be after this service.", None)
-    if next_due and not (next_service_type or "").strip():
-        return (False, "Choose the next service type.", None)
+def _whole(value, field: str, low: int = 0, high: int = 10_000_000) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be a whole number.") from None
+    if not low <= number <= high:
+        raise ValueError(f"{field} must be between {low} and {high}.")
+    return number
+
+
+def _clean_labels(values, field: str) -> list[str]:
+    if values is None:
+        return []
+    if not isinstance(values, list) or len(values) > 30:
+        raise ValueError(f"Invalid {field}.")
+    return list(dict.fromkeys(_clean_text(str(v), 120) for v in values if _clean_text(str(v), 120)))
+
+
+def _clean_parts(rows) -> list[dict]:
+    """Parts replaced: [{part_no, name, qty, amount, warranty}]. Warranty parts
+    aren't charged to the customer."""
+    if rows is None:
+        return []
+    if not isinstance(rows, list) or len(rows) > 60:
+        raise ValueError("Invalid parts list.")
+    clean = []
+    for i, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            raise ValueError("Invalid parts list.")
+        name = _clean_text(row.get("name"), 120)
+        if not name:
+            raise ValueError(f"Part {i}: enter the part name.")
+        clean.append({
+            "part_no": _clean_text(row.get("part_no"), 40),
+            "name": name,
+            "qty": _whole(row.get("qty", 1), f"Part {i} quantity", 1, 999),
+            "amount": _whole(row.get("amount") or 0, f"Part {i} amount"),
+            "warranty": bool(row.get("warranty")),
+        })
+    return clean
+
+
+def _clean_labour(rows) -> list[dict]:
+    """Labour: [{description, amount}]."""
+    if rows is None:
+        return []
+    if not isinstance(rows, list) or len(rows) > 40:
+        raise ValueError("Invalid labour list.")
+    clean = []
+    for i, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            raise ValueError("Invalid labour list.")
+        description = _clean_text(row.get("description"), 160)
+        if not description:
+            raise ValueError(f"Labour {i}: enter the description.")
+        clean.append({"description": description, "amount": _whole(row.get("amount") or 0, f"Labour {i} amount")})
+    return clean
+
+
+def _clean_feedback(value) -> dict:
+    """Customer feedback: {rating, delivery_on_time, washing_quality, ...}; each
+    check is true (Yes/OK) or false (No/Not OK); missing = not asked."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("Invalid customer feedback.")
+    clean = {}
+    if value.get("rating"):
+        if value["rating"] not in FEEDBACK_RATINGS:
+            raise ValueError("Invalid feedback rating.")
+        clean["rating"] = value["rating"]
+    for key in FEEDBACK_CHECKS:
+        if value.get(key) is not None:
+            clean[key] = bool(value[key])
+    return clean
+
+
+def _record_row(row) -> dict:
+    """A service_records row with its JSON fields as lists/dicts."""
+    record = _plain(row)
+    for key in _JSON_FIELDS:
+        raw = record.get(key)
+        try:
+            record[key] = json.loads(raw) if raw else ({} if key == "feedback" else [])
+        except (TypeError, ValueError):
+            record[key] = {} if key == "feedback" else []
+    return record
+
+
+def parts_summary(parts: list[dict]) -> str:
+    """'Engine oil ×1 ₹737; Oil cleaner ×1 ₹265 (warranty)' for exports."""
+    items = []
+    for p in parts:
+        number = " (" + p["part_no"] + ")" if p.get("part_no") else ""
+        warranty = " (warranty)" if p.get("warranty") else ""
+        items.append(f"{p['name']}{number} ×{p['qty']} ₹{p['amount']}{warranty}")
+    return "; ".join(items)
+
+
+def close_service(appointment_id: str, details: dict, pdf: bytes | None, pdf_name: str | None,
+                  actor: str | None = None) -> tuple[bool, str, int | None]:
+    """Close a booking with its job card: saves a maintenance record (the job
+    card's fields) and the scanned job card PDF, marks the booking COMPLETED,
+    and moves the bike on (last service date, odometer, frame/engine numbers,
+    next due service). All in one transaction. Totals are computed here, not
+    trusted from the form. Returns (ok, message, record_id).
+
+    details: service_date (delivered), received_date, service_type, job_type,
+    job_card_no, odometer_km, frame_number, engine_number, customer_requests,
+    jobs_done [str], work_done, parts [{part_no, name, qty, amount, warranty}],
+    labour [{description, amount}], delivery_checks [str], feedback {...},
+    technician, mechanic, supervisor, remarks, next_service_date, next_service_type.
+    """
+    d = details
+    try:
+        day = normalize_date(d.get("service_date"))
+        if not day:
+            raise ValueError("Enter the date the bike was delivered.")
+        if day > today().isoformat():
+            raise ValueError("The delivery date can't be in the future.")
+        received = normalize_date(d.get("received_date")) if d.get("received_date") else None
+        if d.get("received_date") and not received:
+            raise ValueError("Invalid received date.")
+        if received and received > day:
+            raise ValueError("The bike can't be received after it was delivered.")
+        job_type = _clean_text(d.get("job_type"), 40)
+        if job_type and job_type not in JOB_TYPES:
+            raise ValueError(f"Type of job must be one of: {', '.join(JOB_TYPES)}.")
+        odometer = _whole(d["odometer_km"], "Odometer", 0, 1_000_000) if d.get("odometer_km") not in (None, "") else None
+        jobs_done = _clean_labels(d.get("jobs_done"), "jobs done")
+        parts = _clean_parts(d.get("parts"))
+        labour = _clean_labour(d.get("labour"))
+        delivery_checks = _clean_labels(d.get("delivery_checks"), "delivery checks")
+        feedback = _clean_feedback(d.get("feedback"))
+        work_done = _clean_text(d.get("work_done"))
+        if not (jobs_done or work_done or parts or labour):
+            raise ValueError("Record the work done: tick the jobs, add parts or labour, or describe it.")
+        next_due = normalize_date(d.get("next_service_date")) if d.get("next_service_date") else None
+        if d.get("next_service_date") and not next_due:
+            raise ValueError("Invalid next service date.")
+        if next_due and next_due <= day:
+            raise ValueError("The next service must be after this service.")
+        if next_due and not _clean_text(d.get("next_service_type"), 100):
+            raise ValueError("Choose the next service type.")
+        if not pdf:
+            raise ValueError("Attach the job card (PDF).")
+        if len(pdf) > MAX_PDF_BYTES:
+            raise ValueError(f"The PDF is larger than {MAX_PDF_BYTES // (1024 * 1024)} MB.")
+        if not pdf.startswith(b"%PDF"):
+            raise ValueError("The job card must be a PDF file.")
+    except ValueError as e:
+        return (False, str(e), None)
+
+    parts_total = sum(p["qty"] * p["amount"] for p in parts if not p["warranty"])
+    labour_total = sum(item["amount"] for item in labour)
 
     conn = _connect()
     cursor = conn.cursor()
@@ -1041,21 +1173,30 @@ def close_service(
     if not booking:
         conn.close()
         return (False, f"No open booking with ID {appointment_id}.", None)
-    service_type = (service_type or "").strip() or booking["service_type"]
-    filename = re.sub(r"[^\w.\- ]", "_", (pdf_name or "service-report.pdf").strip())[:80] or "service-report.pdf"
+    service_type = _clean_text(d.get("service_type"), 100) or booking["service_type"]
+    frame, engine = _clean_text(d.get("frame_number"), 40), _clean_text(d.get("engine_number"), 40)
+    filename = re.sub(r"[^\w.\- ]", "_", (pdf_name or "job-card.pdf").strip())[:80] or "job-card.pdf"
     if not filename.lower().endswith(".pdf"):
         filename += ".pdf"
     try:
         cursor.execute(
             """
-        INSERT INTO service_records (appointment_id, vehicle_id, customer_id, service_date, service_type,
-            odometer_km, work_done, parts, amount, technician, remarks, next_service_date, next_service_type, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO service_records (appointment_id, vehicle_id, customer_id, job_card_no, job_type,
+            received_date, service_date, service_type, odometer_km, frame_number, engine_number,
+            customer_requests, jobs_done, work_done, parts, labour, parts_total, labour_total, amount,
+            delivery_checks, feedback, technician, mechanic, supervisor, remarks,
+            next_service_date, next_service_type, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
-                booking["id"], booking["vehicle_id"], booking["customer_id"], day, service_type,
-                odometer_km, work_done, _clean_text(parts), amount, _clean_text(technician, 100),
-                _clean_text(remarks), next_due, (next_service_type or "").strip() or None, actor,
+                booking["id"], booking["vehicle_id"], booking["customer_id"],
+                _clean_text(d.get("job_card_no"), 40), job_type, received, day, service_type, odometer,
+                frame, engine, _clean_text(d.get("customer_requests")), json.dumps(jobs_done), work_done,
+                json.dumps(parts), json.dumps(labour), parts_total, labour_total, parts_total + labour_total,
+                json.dumps(delivery_checks), json.dumps(feedback),
+                _clean_text(d.get("technician"), 100), _clean_text(d.get("mechanic"), 100),
+                _clean_text(d.get("supervisor"), 100), _clean_text(d.get("remarks")),
+                next_due, _clean_text(d.get("next_service_type"), 100) if next_due else None, actor,
             ),
         )
         record_id = cursor.lastrowid
@@ -1065,12 +1206,16 @@ def close_service(
         )
         cursor.execute("UPDATE service_appointments SET status = 'COMPLETED' WHERE id = ?", (booking["id"],))
         cursor.execute("UPDATE vehicles SET last_service_date = ? WHERE id = ?", (day, booking["vehicle_id"]))
-        if odometer_km is not None:
-            cursor.execute("UPDATE vehicles SET odometer_km = ? WHERE id = ?", (odometer_km, booking["vehicle_id"]))
+        if odometer is not None:
+            cursor.execute("UPDATE vehicles SET odometer_km = ? WHERE id = ?", (odometer, booking["vehicle_id"]))
+        if frame:
+            cursor.execute("UPDATE vehicles SET frame_number = ? WHERE id = ?", (frame, booking["vehicle_id"]))
+        if engine:
+            cursor.execute("UPDATE vehicles SET engine_number = ? WHERE id = ?", (engine, booking["vehicle_id"]))
         if next_due:
             cursor.execute(
                 "UPDATE vehicles SET next_service_date = ?, next_service_type = ? WHERE id = ?",
-                (next_due, next_service_type.strip(), booking["vehicle_id"]),
+                (next_due, _clean_text(d.get("next_service_type"), 100), booking["vehicle_id"]),
             )
         conn.commit()
     except Exception:
@@ -1083,9 +1228,10 @@ def close_service(
 
 
 def get_service_history(vehicle_id: int) -> list:
-    """A bike's service history, newest first: maintenance records (with their
-    PDF's name and size) and, for older services without a record (e.g. the
-    client's import), the completed booking itself (kind 'booking')."""
+    """A bike's service history, newest first: maintenance records (job card
+    fields, with the PDF's name and size) and, for older services without a
+    record (e.g. the client's import), the completed booking itself (kind
+    'booking')."""
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute(
@@ -1096,7 +1242,7 @@ def get_service_history(vehicle_id: int) -> list:
     """,
         (vehicle_id,),
     )
-    records = [{"kind": "record", **_plain(r)} for r in cursor.fetchall()]
+    records = [{"kind": "record", **_record_row(r)} for r in cursor.fetchall()]
     cursor.execute(
         """
     SELECT a.id AS appointment_id, a.appointment_date AS service_date, a.service_type, a.notes AS remarks
@@ -1126,7 +1272,7 @@ def list_service_records() -> list:
     ORDER BY r.service_date DESC, r.id DESC
     """
     )
-    rows = [_plain(r) for r in cursor.fetchall()]
+    rows = [_record_row(r) for r in cursor.fetchall()]
     conn.close()
     return rows
 
@@ -1528,7 +1674,7 @@ def list_vehicles() -> list:
 
 VEHICLE_FIELDS = (
     "registration_number", "model", "purchase_date", "last_service_date",
-    "odometer_km", "next_service_date", "next_service_type",
+    "odometer_km", "next_service_date", "next_service_type", "frame_number", "engine_number",
 )
 
 

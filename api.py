@@ -465,6 +465,8 @@ class VehiclePatch(BaseModel):
     odometer_km: int | None = None
     next_service_date: str | None = None
     next_service_type: str | None = None
+    frame_number: str | None = None
+    engine_number: str | None = None
 
 
 @api.get("/vehicles")
@@ -665,45 +667,62 @@ def complete_appointment(appointment_id: str, body: CompleteIn | None = None):
     )
 
 
+def _json_field(raw: str | None, field: str):
+    if raw in (None, ""):
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid {field}.") from None
+
+
 @api.post("/appointments/{appointment_id}/close", status_code=201)
 def close_service(
     appointment_id: str,
-    service_date: str = Form(...),
-    work_done: str = Form(...),
-    report: UploadFile = File(..., description="Service report PDF"),
+    service_date: str = Form(..., description="Delivered on (YYYY-MM-DD)"),
+    report: UploadFile = File(..., description="Scanned job card / service report (PDF)"),
+    received_date: str | None = Form(None),
     service_type: str | None = Form(None),
-    odometer_km: int | None = Form(None),
-    parts: str | None = Form(None),
-    amount: int | None = Form(None),
+    job_type: str | None = Form(None),
+    job_card_no: str | None = Form(None),
+    odometer_km: str | None = Form(None),
+    frame_number: str | None = Form(None),
+    engine_number: str | None = Form(None),
+    customer_requests: str | None = Form(None),
+    jobs_done: str | None = Form(None, description='JSON list, e.g. ["Water wash", "Chain lube"]'),
+    work_done: str | None = Form(None),
+    parts: str | None = Form(None, description="JSON list of {part_no, name, qty, amount, warranty}"),
+    labour: str | None = Form(None, description="JSON list of {description, amount}"),
+    delivery_checks: str | None = Form(None, description="JSON list of ticked delivery checks"),
+    feedback: str | None = Form(None, description="JSON {rating, delivery_on_time, washing_quality, ...}"),
     technician: str | None = Form(None),
+    mechanic: str | None = Form(None),
+    supervisor: str | None = Form(None),
     remarks: str | None = Form(None),
     next_service_date: str | None = Form(None),
     next_service_type: str | None = Form(None),
     user: dict = Depends(current_user),
 ):
-    """Workshop: close a booking with what was done and the service report PDF
-    (multipart form). Saves the maintenance record and moves the bike on to its
-    next service."""
+    """Workshop: close a booking with its job card (multipart form): the job
+    card's fields and the scanned PDF. Saves the maintenance record and moves
+    the bike on to its next service. Totals are computed by the server."""
+    details = {
+        "service_date": service_date, "received_date": received_date, "service_type": service_type,
+        "job_type": job_type, "job_card_no": job_card_no, "odometer_km": odometer_km,
+        "frame_number": frame_number, "engine_number": engine_number,
+        "customer_requests": customer_requests, "work_done": work_done,
+        "jobs_done": _json_field(jobs_done, "jobs done"), "parts": _json_field(parts, "parts"),
+        "labour": _json_field(labour, "labour"), "delivery_checks": _json_field(delivery_checks, "delivery checks"),
+        "feedback": _json_field(feedback, "feedback"),
+        "technician": technician, "mechanic": mechanic, "supervisor": supervisor, "remarks": remarks,
+        "next_service_date": next_service_date, "next_service_type": next_service_type,
+    }
     pdf = report.file.read(database.MAX_PDF_BYTES + 1)  # one byte over = too big
     ok, message, record_id = database.close_service(
-        appointment_id,
-        service_date=service_date,
-        service_type=service_type,
-        odometer_km=odometer_km,
-        work_done=work_done,
-        pdf=pdf,
-        pdf_name=report.filename,
-        parts=parts,
-        amount=amount,
-        technician=technician,
-        remarks=remarks,
-        next_service_date=next_service_date,
-        next_service_type=next_service_type,
-        actor=user.get("full_name") or user["username"],
+        appointment_id, details, pdf, report.filename, actor=user.get("full_name") or user["username"]
     )
     if not ok:
-        status = 404 if message.startswith("No open booking") else 400
-        raise HTTPException(status_code=status, detail=message)
+        raise HTTPException(status_code=404 if message.startswith("No open booking") else 400, detail=message)
     return {"message": message, "id": record_id}
 
 
