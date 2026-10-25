@@ -173,8 +173,15 @@ GREETING_KICKOFF = (
 
 
 def _say_date(day: str | None) -> str:
-    """'2026-10-23' -> 'Fri 23 Oct' (easy to speak; tools still use ISO)."""
-    return database._human_day(day).replace(",", "") if day else "never"
+    """'2026-10-23' -> 'Fri 23 Oct', for the agent to speak (the CRM shows
+    DD-MM-YYYY; spoken, a day and month sound natural). Tools still use ISO."""
+    if not day:
+        return "never"
+    try:
+        when = date.fromisoformat(str(day)[:10])
+    except ValueError:
+        return str(day)
+    return f"{when.strftime('%a')} {when.day} {when.strftime('%b')}"
 
 
 def _service_info(customer: dict) -> str:
@@ -410,7 +417,7 @@ class ServiceCall:
         vehicle = self.customer["vehicles"][0]
         notes = args.get("notes")
         if outcome == "date_confirmed" and self.booked_date:
-            visit = f"Coming on {_say_date(self.booked_date)} for {self.booked_service}"
+            visit = f"Coming on {database._human_day(self.booked_date)} for {self.booked_service}"
             notes = f"{visit}. {notes}" if notes else visit
         ok, message = database.log_call(
             self.customer_id,

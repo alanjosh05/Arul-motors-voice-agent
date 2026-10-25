@@ -42,12 +42,16 @@ DELIVERY_CHECKS = [
 ]
 
 
+# Kept lean on purpose: field names, descriptions and the prompt are sent with
+# every card, and every field comes back (as null when blank), so only fields
+# the Close service form uses are asked for. The two scanned pages are most of
+# the cost (~2.4k of ~2.7k input tokens).
 class Part(BaseModel):
-    part_no: str | None = Field(None, description="Part number exactly as written, e.g. 90793-AD411")
-    name: str = Field(description="Part name, e.g. Engine oil")
-    qty: int = Field(1, description="Quantity")
-    amount: int | None = Field(None, description="Rupees written for this line (whole number)")
-    warranty: bool = Field(False, description="True only if listed under UNDER WARRANTY")
+    part_no: str | None = None
+    name: str
+    qty: int = 1
+    amount: int | None = Field(None, description="₹ on the row")
+    warranty: bool = Field(False, description="row is under UNDER WARRANTY")
 
 
 class Labour(BaseModel):
@@ -58,59 +62,41 @@ class Labour(BaseModel):
 class Feedback(BaseModel):
     rating: Literal[tuple(database.FEEDBACK_RATINGS)] | None = None  # type: ignore[valid-type]
     delivery_on_time: bool | None = None
-    washing_quality: bool | None = Field(None, description="True = OK, False = NOT OK")
+    washing_quality: bool | None = Field(None, description="OK=true")
     staff_behaviour: bool | None = None
     fairness_of_charges: bool | None = None
     repairing_quality: bool | None = None
 
 
 class JobCard(BaseModel):
-    job_card_no: str | None = Field(None, description="CARD No. printed/written at the top")
-    job_type: Literal[tuple(database.JOB_TYPES)] | None = Field(  # type: ignore[valid-type]
-        None, description="TYPE OF JOB that is circled/ticked"
-    )
-    free_service_number: int | None = Field(None, description="Which free service is circled (1-6), if a free service")
+    job_card_no: str | None = None
+    job_type: Literal[tuple(database.JOB_TYPES)] | None = None  # type: ignore[valid-type]
     registration_number: str | None = None
-    model: str | None = Field(None, description="Vehicle model as written")
-    odometer_km: int | None = Field(None, description="Odometer reading")
-    received_date: str | None = Field(None, description="Vehicle receiving date as YYYY-MM-DD")
-    delivered_date: str | None = Field(None, description="Delivery / job closing date as YYYY-MM-DD, if written")
-    frame_number: str | None = Field(None, description="Frame / chassis number (often 17 characters, starts ME1)")
+    odometer_km: int | None = None
+    received_date: str | None = None
+    delivered_date: str | None = None
+    frame_number: str | None = None
     engine_number: str | None = None
-    customer_name: str | None = None
-    mobile_number: str | None = None
-    customer_requests: str | None = Field(None, description="CUSTOMER DEMANDED REPAIRS / OBSERVATION lines, comma-separated")
-    jobs_done: list[Literal[tuple(JOBS_DONE)]] = Field(  # type: ignore[valid-type]
-        default_factory=list, description="Jobs from the fixed list that were done (from supervisor observation ticks and the requests)"
-    )
-    other_work: str | None = Field(None, description="Other work or observations not in jobs_done")
-    parts: list[Part] = Field(default_factory=list, description="PARTS REPLACED / REPAIRED and UNDER WARRANTY rows")
-    labour: list[Labour] = Field(default_factory=list, description="LABOUR rows with a description")
+    customer_requests: str | None = None
+    jobs_done: list[Literal[tuple(JOBS_DONE)]] = Field(default_factory=list)  # type: ignore[valid-type]
+    other_work: str | None = None
+    parts: list[Part] = Field(default_factory=list)
+    labour: list[Labour] = Field(default_factory=list)
     delivery_checks: list[Literal[tuple(DELIVERY_CHECKS)]] = Field(default_factory=list)  # type: ignore[valid-type]
     feedback: Feedback = Field(default_factory=Feedback)
-    technician: str | None = Field(None, description="ALLOTED BAY NO. / TECHNICIAN NAME")
+    technician: str | None = None
     mechanic: str | None = None
     supervisor: str | None = None
     remarks: str | None = None
-    total_amount: int | None = Field(None, description="TOTAL / G.TOTAL written on the card")
+    total_amount: int | None = Field(None, description="₹ total: TOTAL/G.TOTAL, or a sum written below the parts")
 
 
-PROMPT = """This is a scanned job card from Arul Motors (Yamaha), Nazareth, Tamil Nadu,
-partly handwritten. Read it and fill the fields.
-
-Rules:
-- Only use what is written or ticked on the card. If a field is blank or you can't
-  read it, leave it null (or an empty list). Never guess.
-- Dates on the card are Indian (DD/MM/YY or DD/MM/YYYY); return them as YYYY-MM-DD
-  (e.g. 23/10/26 -> 2026-10-23).
-- Amounts are whole rupees. Part rows: part number, part name, quantity and the
-  rupee amount on that row. Rows under UNDER WARRANTY have warranty = true.
-- A total written on its own (e.g. under the parts) is total_amount, not a part.
-- Signatures, initials and stamps are not data.
-- jobs_done: pick from the allowed list only what was done or requested and done
-  (e.g. "Oil change" written -> "Engine oil change"; "Water wash" -> "Water wash").
-- Copy part numbers, frame and registration numbers character by character.
-"""
+PROMPT = """Scanned Yamaha job card (Arul Motors), partly handwritten. Fill only what is
+written, circled or ticked; blank or unreadable = null or []. Never guess.
+Dates: DD/MM/YY on the card -> YYYY-MM-DD. Amounts: whole rupees. A total written on
+its own is total_amount, not a part. Copy part, frame and registration numbers exactly.
+jobs_done: map written jobs to the allowed values (Oil change -> Engine oil change).
+customer_requests: the CUSTOMER DEMANDED lines. Ignore signatures and stamps."""
 
 _client: genai.Client | None = None
 

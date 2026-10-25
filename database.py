@@ -592,9 +592,16 @@ def _check_appointment_date(value: str) -> tuple[str | None, str | None]:
     return (appointment_date, None)
 
 
+# Dates shown to people (CRM messages, notifications, notes) are DD-MM-YYYY.
+# Stored dates stay YYYY-MM-DD: they sort and compare correctly as text, and
+# normalize_date accepts both, so either can be typed or sent back.
+DISPLAY_DATE = "%d-%m-%Y"
+
+
 def _spoken(day: str) -> str:
-    """'2026-10-21' -> '2026-10-21 (Wednesday)', so the agent can say the day."""
-    return f"{day} ({date.fromisoformat(day).strftime('%A')})"
+    """'2026-10-21' -> '21-10-2026 (Wednesday)', so staff and the agent see the day."""
+    when = date.fromisoformat(day)
+    return f"{when.strftime(DISPLAY_DATE)} ({when.strftime('%A')})"
 
 
 # ---------------------------------------------------------------------------
@@ -2340,9 +2347,9 @@ def _customer_name(customer_id: int) -> str:
 
 
 def _human_day(day: str | None) -> str:
-    """'2026-10-23' -> 'Fri, 23 Oct'."""
+    """'2026-10-23' -> 'Fri, 23-10-2026' (notifications and notes staff read)."""
     try:
-        return date.fromisoformat(str(day)[:10]).strftime("%a, %d %b").replace(" 0", " ")
+        return date.fromisoformat(str(day)[:10]).strftime(f"%a, {DISPLAY_DATE}")
     except (TypeError, ValueError):
         return str(day or "")
 

@@ -1224,3 +1224,18 @@ def test_service_type_overdue_days_decide_when_a_bike_is_overdue(db, monkeypatch
     due = {d["vehicle_id"]: d for d in client.get("/api/due-services", params={"days": 7}).json()}
     assert due[karthik["id"]]["is_overdue"] is True and due[karthik["id"]]["overdue_days"] == 0
     assert client.get("/api/stats").json()["totals"]["overdue"] == overdue_before + 1
+
+
+def test_dates_shown_to_people_are_dd_mm_yyyy(db):
+    """Stored dates stay YYYY-MM-DD (they sort and compare), but every date
+    people read is DD-MM-YYYY, and DD-MM-YYYY is accepted back."""
+    import bot
+
+    assert db._human_day("2026-10-23") == "Fri, 23-10-2026"
+    assert db._spoken("2026-10-21") == "21-10-2026 (Wednesday)"
+    assert db.normalize_date("26-10-2026") == "2026-10-26"
+    assert bot._say_date("2026-10-23") == "Fri 23 Oct"  # spoken by the agent, not shown
+    ok, message, aid = db.create_appointment(1, days_ahead(2))
+    assert ok and db.get_appointment(aid)["appointment_date"] == days_ahead(2)  # stored ISO
+    shown = date.fromisoformat(days_ahead(2)).strftime("%d-%m-%Y")
+    assert shown in message
