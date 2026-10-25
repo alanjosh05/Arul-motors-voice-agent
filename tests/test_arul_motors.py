@@ -40,6 +40,9 @@ def db(request, tmp_path, monkeypatch):
     import database
 
     monkeypatch.setattr(database, "DB_FILE", str(tmp_path / "test.db"))
+    # Tests run at any hour: the CRM is open all day unless a test says otherwise.
+    monkeypatch.setattr(database, "SHIFT_START", "00:00")
+    monkeypatch.setattr(database, "SHIFT_END", "24:00")
     # Tests book "n days ahead", which may be a Sunday: open every day unless a
     # test sets closed days itself.
     monkeypatch.setattr(database, "CLOSED_WEEKDAYS", set())
@@ -1239,3 +1242,44 @@ def test_dates_shown_to_people_are_dd_mm_yyyy(db):
     assert ok and db.get_appointment(aid)["appointment_date"] == days_ahead(2)  # stored ISO
     shown = date.fromisoformat(days_ahead(2)).strftime("%d-%m-%Y")
     assert shown in message
+
+
+def test_out_of_shift_hours_only_admins(db, monkeypatch):
+    """07:00-21:00: everyone. Outside: staff are refused (requests, sign-in,
+    live feed); admins and the API key still work. /api/health says which."""
+    from datetime import datetime
+
+    from fastapi.testclient import TestClient
+
+    import api
+    import auth
+
+    tz = db.SHOWROOM_TZ
+    monkeypatch.setattr(db, "SHIFT_START", "07:00")
+    monkeypatch.setattr(db, "SHIFT_END", "21:00")
+    assert db.shift_info(datetime(2026, 10, 25, 6, 59, tzinfo=tz))["open"] is False
+    assert db.shift_info(datetime(2026, 10, 25, 7, 0, tzinfo=tz)) == {
+        "open": True, "start": "07:00", "end": "21:00", "changes_at": "2026-10-25T21:00+05:30"}
+    assert db.shift_info(datetime(2026, 10, 25, 21, 0, tzinfo=tz))["changes_at"] == "2026-10-26T07:00+05:30"
+
+    admin = _api_client(monkeypatch)
+    staff = _api_client(monkeypatch, admin=False)
+    monkeypatch.setattr(db, "shift_info", lambda at=None: {"open": False, "start": "07:00", "end": "21:00", "changes_at": "x"})
+    r = staff.get("/api/customers")
+    assert r.status_code == 403 and r.json()["detail"].startswith("Out of shift hours")
+    login = TestClient(api.app).post("/api/auth/login", json={"username": "staff1", "password": "password123"})
+    assert login.status_code == 403
+    wrong = TestClient(api.app).post("/api/auth/login", json={"username": "staff1", "password": "nope-wrong"})
+    assert wrong.status_code == 401  # wrong password still just "wrong password"
+    assert admin.get("/api/customers").status_code == 200
+    assert TestClient(api.app).post("/api/auth/login", json={"username": "admin1", "password": "password123"}).status_code == 200
+    assert TestClient(api.app).get("/api/health").json()["shift"]["open"] is False
+
+    import pytest
+    from starlette.websockets import WebSocketDisconnect
+
+    token = auth.create_token(db.get_staff_user(username="staff1"))
+    with pytest.raises(WebSocketDisconnect) as closed:
+        with TestClient(api.app).websocket_connect(f"/api/ws?token={token}") as ws:
+            ws.receive_text()
+    assert closed.value.code == 4403

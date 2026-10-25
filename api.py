@@ -279,12 +279,22 @@ def current_user(
         payload = auth.read_token(authorization.split(" ", 1)[1].strip())
         user = database.get_staff_user(user_id=payload["sub"]) if payload else None
         if user:
+            _check_shift(user)
             return user
         raise HTTPException(status_code=401, detail="Session expired. Please sign in again.")
     expected = os.getenv("API_KEY")
     if expected and x_api_key and secrets.compare_digest(x_api_key, expected):
         return {"id": 0, "username": "api-key", "full_name": "API key", "role": "admin"}
     raise HTTPException(status_code=401, detail="Sign in required.")
+
+
+def _check_shift(user: dict) -> None:
+    """Outside working hours only admins may use the CRM."""
+    if user["role"] != "admin" and not database.shift_info()["open"]:
+        raise HTTPException(
+            status_code=403,
+            detail=database.OUT_OF_SHIFT.format(start=database.SHIFT_START, end=database.SHIFT_END),
+        )
 
 
 def admin_user(user: dict = Depends(current_user)) -> dict:
@@ -318,12 +328,15 @@ def login(body: LoginIn, request: Request):
         raise HTTPException(status_code=401, detail="Wrong username or password.")
     login_throttle.succeeded(client)
     user.pop("password_hash")
+    _check_shift(user)  # after the password check, so it says nothing about wrong logins
     return {"token": auth.create_token(user), "user": user}
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "time": database.now().isoformat(timespec="seconds")}
+    """Public: up/down, the showroom clock and working hours (the CRM uses the
+    server's clock for shift hours, not the device's)."""
+    return {"status": "ok", "time": database.now().isoformat(timespec="seconds"), "shift": database.shift_info()}
 
 
 @app.websocket("/api/ws")
@@ -336,6 +349,9 @@ async def live_socket(websocket: WebSocket, token: str = ""):
     user = await asyncio.to_thread(database.get_staff_user, user_id=payload["sub"]) if payload else None
     if not user:
         await websocket.close(code=4401)
+        return
+    if user["role"] != "admin" and not database.shift_info()["open"]:
+        await websocket.close(code=4403)  # out of shift hours
         return
     await websocket.accept()
     hub.sockets.add(websocket)

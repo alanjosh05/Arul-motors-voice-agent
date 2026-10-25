@@ -73,6 +73,42 @@ CALL_OUTCOMES = {
 }
 
 
+# Working hours (showroom time). Outside them the CRM is closed to staff;
+# admins can still use it (after accepting a warning in the CRM). The VM's
+# instance schedule (deploy/GCP-LESSONS.md, Lesson 10) matches these hours.
+SHIFT_START = os.getenv("SHIFT_START", "07:00")
+SHIFT_END = os.getenv("SHIFT_END", "21:00")
+
+
+def _minutes(value: str) -> int:
+    """'07:00' -> 420; '24:00' (end of the day) -> 1440."""
+    hours, minutes = value.split(":")
+    return int(hours) * 60 + int(minutes)
+
+
+def shift_info(at: datetime | None = None) -> dict:
+    """Whether the CRM is within working hours now, and when that changes."""
+    at = at or now()
+    midnight = at.replace(hour=0, minute=0, second=0, microsecond=0)
+    minute, start, end = at.hour * 60 + at.minute, _minutes(SHIFT_START), _minutes(SHIFT_END)
+    is_open = start <= minute < end
+    if is_open:
+        changes_at = midnight + timedelta(minutes=end)  # closes
+    elif minute < start:
+        changes_at = midnight + timedelta(minutes=start)  # opens later today
+    else:
+        changes_at = midnight + timedelta(days=1, minutes=start)  # opens tomorrow
+    return {
+        "open": is_open,
+        "start": SHIFT_START,
+        "end": SHIFT_END,
+        "changes_at": changes_at.isoformat(timespec="minutes"),
+    }
+
+
+OUT_OF_SHIFT = "Out of shift hours: the CRM is open {start} – {end}. Only admins can use it now."
+
+
 def now() -> datetime:
     """Current date and time at the showroom."""
     return datetime.now(SHOWROOM_TZ)
