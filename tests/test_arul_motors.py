@@ -1306,3 +1306,48 @@ def test_admin_deletes_calls_one_or_all(db, monkeypatch):
     assert r.json()["deleted"] == 2 and [c["outcome"] for c in admin.get("/api/calls").json()] == ["callback_requested"]
     assert admin.delete("/api/calls").json()["deleted"] == 1
     assert admin.get("/api/calls/count").json()["total"] == 0
+
+
+def test_edit_a_closed_service(db, monkeypatch):
+    """Edit a service record: fields change, totals are recomputed, a new PDF
+    replaces the job card, and the bike follows only its latest record."""
+    import json
+
+    client = _api_client(monkeypatch, admin=False)
+    bike = db.get_customer(1)["vehicles"][0]
+
+    def close(day_offset: int, km: str) -> int:
+        aid = client.post("/api/appointments", json={"customer_id": 1, "appointment_date": days_ahead(1)}).json()["id"]
+        form = {"service_date": days_ahead(day_offset), "odometer_km": km, "jobs_done": json.dumps(["Water wash"]),
+                "next_service_date": days_ahead(90), "next_service_type": "Second free service"}
+        r = client.post(f"/api/appointments/{aid}/close", data=form, files={"report": ("a.pdf", PDF, "application/pdf")})
+        assert r.status_code == 201, r.text
+        return r.json()["id"]
+
+    older = close(-10, "1000")
+    latest = close(0, "2000")
+
+    edit = {
+        "service_date": days_ahead(0), "odometer_km": "2100", "job_card_no": "7001",
+        "parts": json.dumps([{"name": "Engine oil", "qty": 2, "amount": 400}]),
+        "next_service_date": days_ahead(100), "next_service_type": "Third free service",
+    }
+    new_pdf = b"%PDF-1.4\n% replaced\n%%EOF\n"
+    r = client.patch(f"/api/service-records/{latest}", data=edit, files={"report": ("new.pdf", new_pdf, "application/pdf")})
+    assert r.status_code == 200, r.text
+    rec = client.get(f"/api/vehicles/{bike['id']}/service-history").json()[0]
+    assert (rec["id"], rec["job_card_no"], rec["odometer_km"], rec["amount"]) == (latest, "7001", 2100, 800)
+    assert rec["updated_by"] == "Test staff" and rec["document_name"] == "new.pdf"
+    assert client.get(f"/api/service-records/{latest}/report").content == new_pdf
+    v = db.get_customer(1)["vehicles"][0]
+    assert (v["odometer_km"], v["next_service_date"], v["next_service_type"]) == (2100, days_ahead(100), "Third free service")
+
+    # Editing an older record doesn't move the bike; no PDF keeps the old one.
+    assert client.patch(f"/api/service-records/{older}", data={**edit, "service_date": days_ahead(-10), "odometer_km": "999"}).status_code == 200
+    assert db.get_customer(1)["vehicles"][0]["odometer_km"] == 2100
+    assert client.get(f"/api/service-records/{older}/report").content == PDF
+
+    # Same rules as closing.
+    assert client.patch(f"/api/service-records/{latest}", data={**edit, "service_date": days_ahead(3)}).status_code == 400
+    assert client.patch(f"/api/service-records/{latest}", data=edit, files={"report": ("x.pdf", b"nope", "application/pdf")}).status_code == 400
+    assert client.patch("/api/service-records/9999", data=edit).status_code == 404

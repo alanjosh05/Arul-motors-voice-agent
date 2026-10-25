@@ -695,11 +695,8 @@ def _json_field(raw: str | None, field: str):
         raise HTTPException(status_code=400, detail=f"Invalid {field}.") from None
 
 
-@api.post("/appointments/{appointment_id}/close", status_code=201)
-def close_service(
-    appointment_id: str,
-    service_date: str = Form(..., description="Delivered on (YYYY-MM-DD)"),
-    report: UploadFile = File(..., description="Scanned job card / service report (PDF)"),
+def job_card_form(
+    service_date: str = Form(..., description="Delivered on (YYYY-MM-DD or DD-MM-YYYY)"),
     received_date: str | None = Form(None),
     service_type: str | None = Form(None),
     job_type: str | None = Form(None),
@@ -720,12 +717,9 @@ def close_service(
     remarks: str | None = Form(None),
     next_service_date: str | None = Form(None),
     next_service_type: str | None = Form(None),
-    user: dict = Depends(current_user),
-):
-    """Workshop: close a booking with its job card (multipart form): the job
-    card's fields and the scanned PDF. Saves the maintenance record and moves
-    the bike on to its next service. Totals are computed by the server."""
-    details = {
+) -> dict:
+    """The job card's fields from a multipart form (Close service and its edit)."""
+    return {
         "service_date": service_date, "received_date": received_date, "service_type": service_type,
         "job_type": job_type, "job_card_no": job_card_no, "odometer_km": odometer_km,
         "frame_number": frame_number, "engine_number": engine_number,
@@ -736,6 +730,18 @@ def close_service(
         "technician": technician, "mechanic": mechanic, "supervisor": supervisor, "remarks": remarks,
         "next_service_date": next_service_date, "next_service_type": next_service_type,
     }
+
+
+@api.post("/appointments/{appointment_id}/close", status_code=201)
+def close_service(
+    appointment_id: str,
+    details: dict = Depends(job_card_form),
+    report: UploadFile = File(..., description="Scanned job card / service report (PDF)"),
+    user: dict = Depends(current_user),
+):
+    """Workshop: close a booking with its job card (multipart form): the job
+    card's fields and the scanned PDF. Saves the maintenance record and moves
+    the bike on to its next service. Totals are computed by the server."""
     pdf = report.file.read(database.MAX_PDF_BYTES + 1)  # one byte over = too big
     ok, message, record_id = database.close_service(
         appointment_id, details, pdf, report.filename, actor=user.get("full_name") or user["username"]
@@ -743,6 +749,23 @@ def close_service(
     if not ok:
         raise HTTPException(status_code=404 if message.startswith("No open booking") else 400, detail=message)
     return {"message": message, "id": record_id}
+
+
+@api.patch("/service-records/{record_id}")
+def edit_service_record(
+    record_id: int,
+    details: dict = Depends(job_card_form),
+    report: UploadFile | None = File(None, description="A new job card PDF (optional; replaces the current one)"),
+    user: dict = Depends(current_user),
+):
+    """Edit a closed service's job card fields (multipart form, same fields as
+    closing). A new PDF replaces the job card; without one it stays."""
+    pdf = report.file.read(database.MAX_PDF_BYTES + 1) if report else None
+    return _check(
+        database.update_service_record(
+            record_id, details, pdf, report.filename if report else None, actor=user.get("full_name") or user["username"]
+        )
+    )  # 404 for "Service record not found.", 400 for anything else
 
 
 @api.post("/job-card/extract")
