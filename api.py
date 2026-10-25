@@ -768,6 +768,13 @@ def edit_service_record(
     )  # 404 for "Service record not found.", 400 for anything else
 
 
+@api.delete("/service-records/{record_id}", dependencies=[Depends(admin_user)])
+def delete_service_record(record_id: int):
+    """Admins: delete a closed service (record and job card PDF). Its booking
+    opens again and the bike goes back to how it was before closing."""
+    return _check(database.delete_service_record(record_id))
+
+
 @api.post("/job-card/extract")
 def extract_job_card(report: UploadFile = File(..., description="Scanned job card (PDF)")):
     """Read a scanned job card with Gemini and return its fields to pre-fill

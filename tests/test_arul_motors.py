@@ -1351,3 +1351,29 @@ def test_edit_a_closed_service(db, monkeypatch):
     assert client.patch(f"/api/service-records/{latest}", data={**edit, "service_date": days_ahead(3)}).status_code == 400
     assert client.patch(f"/api/service-records/{latest}", data=edit, files={"report": ("x.pdf", b"nope", "application/pdf")}).status_code == 400
     assert client.patch("/api/service-records/9999", data=edit).status_code == 404
+
+
+def test_delete_a_closed_service_reopens_its_booking_and_restores_the_bike(db, monkeypatch):
+    """Admins delete a service: the record and PDF go, the booking is upcoming
+    again, and the bike is back to how it was before closing."""
+    import json
+
+    staff = _api_client(monkeypatch, admin=False)
+    before = db.get_customer(1)["vehicles"][0]
+    aid = staff.post("/api/appointments", json={"customer_id": 1, "appointment_date": days_ahead(1)}).json()["id"]
+    form = {"service_date": days_ahead(0), "odometer_km": "5000", "jobs_done": json.dumps(["Water wash"]),
+            "next_service_date": days_ahead(90), "next_service_type": "Second free service"}
+    rid = staff.post(f"/api/appointments/{aid}/close", data=form, files={"report": ("a.pdf", PDF, "application/pdf")}).json()["id"]
+    assert "bike_before" not in staff.get(f"/api/vehicles/{before['id']}/service-history").json()[0]
+
+    assert staff.delete(f"/api/service-records/{rid}").status_code == 403  # admins only
+    admin = _api_client(monkeypatch, admin=True)
+    r = admin.delete(f"/api/service-records/{rid}")
+    assert r.status_code == 200, r.text
+    assert admin.get(f"/api/service-records/{rid}/report").status_code == 404
+    assert all(i.get("id") != rid for i in admin.get(f"/api/vehicles/{before['id']}/service-history").json())
+    assert [a["id"] for a in db.get_appointments(1)] == [aid]  # upcoming again, can be closed again
+    after = db.get_customer(1)["vehicles"][0]
+    for column in db.BIKE_STATE:
+        assert after[column] == before[column], column
+    assert admin.delete(f"/api/service-records/{rid}").status_code == 404

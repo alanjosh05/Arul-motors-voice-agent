@@ -451,6 +451,9 @@ def init_db():
     """)
     _ensure_column(cursor, "service_records", "updated_by", t["str"])
     _ensure_column(cursor, "service_records", "updated_at", "TIMESTAMP NULL")
+    # The bike as it was before this service was closed (JSON), so deleting
+    # the record can put the bike back.
+    _ensure_column(cursor, "service_records", "bike_before", "TEXT")
     # Bikes: frame (chassis) and engine numbers, filled from the job card.
     _ensure_column(cursor, "vehicles", "frame_number", t["str"])
     _ensure_column(cursor, "vehicles", "engine_number", t["str"])
@@ -1162,6 +1165,7 @@ def _clean_feedback(value) -> dict:
 def _record_row(row) -> dict:
     """A service_records row with its JSON fields as lists/dicts."""
     record = _plain(row)
+    record.pop("bike_before", None)  # internal: for deleting the record
     for key in _JSON_FIELDS:
         raw = record.get(key)
         try:
@@ -1256,6 +1260,10 @@ def _pdf_filename(name: str | None) -> str:
     return filename if filename.lower().endswith(".pdf") else filename + ".pdf"
 
 
+# What closing a service changes on the bike (and deleting the record restores).
+BIKE_STATE = ("last_service_date", "next_service_date", "next_service_type", "odometer_km", "frame_number", "engine_number")
+
+
 def _move_bike_on(cursor, vehicle_id: int, rec: dict) -> None:
     """The bike takes its last service, odometer, frame/engine numbers and next
     due service from its latest maintenance record."""
@@ -1300,8 +1308,11 @@ def close_service(appointment_id: str, details: dict, pdf: bytes | None, pdf_nam
         conn.close()
         return (False, f"No open booking with ID {appointment_id}.", None)
     rec["service_type"] = rec["service_type"] or booking["service_type"]
-    columns = ["appointment_id", "vehicle_id", "customer_id", *rec, "created_by"]
-    values = [booking["id"], booking["vehicle_id"], booking["customer_id"], *rec.values(), actor]
+    cursor.execute(f"SELECT {', '.join(BIKE_STATE)} FROM vehicles WHERE id = ?", (booking["vehicle_id"],))
+    bike = cursor.fetchone()
+    bike_before = json.dumps({column: bike[column] for column in BIKE_STATE}) if bike else None
+    columns = ["appointment_id", "vehicle_id", "customer_id", *rec, "created_by", "bike_before"]
+    values = [booking["id"], booking["vehicle_id"], booking["customer_id"], *rec.values(), actor, bike_before]
     try:
         cursor.execute(
             f"INSERT INTO service_records ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
@@ -1370,6 +1381,80 @@ def update_service_record(record_id: int, details: dict, pdf: bytes | None = Non
     conn.close()
     _record_change(["vehicles", "service_records", "customers", "due", "stats"], current["customer_id"])
     return (True, "Service record updated.")
+
+
+def delete_service_record(record_id: int) -> tuple[bool, str]:
+    """Delete a maintenance record and its job card PDF (admins). Its booking
+    opens again (CONFIRMED), so the service is upcoming and can be closed
+    again. If it was the bike's latest record, the bike goes back to how it
+    was before the service was closed."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM service_records WHERE id = ?", (record_id,))
+    current = cursor.fetchone()
+    if not current:
+        conn.close()
+        return (False, "Service record not found.")
+    vehicle_id = current["vehicle_id"]
+    cursor.execute(
+        "SELECT id FROM service_appointments WHERE vehicle_id = ? AND status = 'CONFIRMED' AND id != ?",
+        (vehicle_id, current["appointment_id"] or ""),
+    )
+    other = cursor.fetchone()
+    if other and current["appointment_id"]:
+        conn.close()
+        return (False, f"This bike already has booking {other['id']}. Cancel or close it first, then delete this service.")
+    cursor.execute(
+        "SELECT id FROM service_records WHERE vehicle_id = ? ORDER BY service_date DESC, id DESC LIMIT 1", (vehicle_id,)
+    )
+    latest = cursor.fetchone()["id"] == record_id
+    try:
+        cursor.execute("DELETE FROM service_documents WHERE record_id = ?", (record_id,))
+        cursor.execute("DELETE FROM service_records WHERE id = ?", (record_id,))
+        if current["appointment_id"]:
+            cursor.execute(
+                "UPDATE service_appointments SET status = 'CONFIRMED' WHERE id = ?", (current["appointment_id"],)
+            )
+        if latest:
+            before = json.loads(current["bike_before"]) if current["bike_before"] else None
+            if before:
+                assignments = ", ".join(f"{column} = ?" for column in BIKE_STATE)
+                cursor.execute(
+                    f"UPDATE vehicles SET {assignments} WHERE id = ?", [*(before.get(c) for c in BIKE_STATE), vehicle_id]
+                )
+            else:
+                # Closed before the bike's state was kept: the service it was
+                # booked for is due again; the last service is the previous one.
+                cursor.execute(
+                    "SELECT service_date FROM service_records WHERE vehicle_id = ? ORDER BY service_date DESC, id DESC LIMIT 1",
+                    (vehicle_id,),
+                )
+                previous = cursor.fetchone()
+                cursor.execute(
+                    "SELECT max(appointment_date) AS day FROM service_appointments WHERE vehicle_id = ? AND status = 'COMPLETED'",
+                    (vehicle_id,),
+                )
+                days = [d for d in (previous and previous["service_date"], cursor.fetchone()["day"]) if d]
+                cursor.execute("SELECT last_service_date FROM vehicles WHERE id = ?", (vehicle_id,))
+                last = cursor.fetchone()["last_service_date"]
+                if last == current["service_date"]:
+                    last = max(days) if days else None
+                cursor.execute("SELECT appointment_date, service_type FROM service_appointments WHERE id = ?",
+                               (current["appointment_id"] or "",))
+                booking = cursor.fetchone()
+                cursor.execute(
+                    "UPDATE vehicles SET last_service_date = ?, next_service_date = ?, next_service_type = ? WHERE id = ?",
+                    (last, booking["appointment_date"] if booking else current["service_date"],
+                     booking["service_type"] if booking else current["service_type"], vehicle_id),
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+    _record_change(BOOKING_ENTITIES + ["vehicles", "service_records"], current["customer_id"])
+    return (True, "Service deleted. Its booking is open again." if current["appointment_id"] else "Service deleted.")
 
 
 def get_service_history(vehicle_id: int) -> list:
