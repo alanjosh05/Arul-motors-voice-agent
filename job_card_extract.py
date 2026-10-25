@@ -91,12 +91,41 @@ class JobCard(BaseModel):
     total_amount: int | None = Field(None, description="₹ total: TOTAL/G.TOTAL, or a sum written below the parts")
 
 
-PROMPT = """Scanned Yamaha job card (Arul Motors), partly handwritten. Fill only what is
-written, circled or ticked; blank or unreadable = null or []. Never guess.
-Dates: DD/MM/YY on the card. Amounts: whole rupees. A total written on
-its own is total_amount, not a part. Copy part, frame and registration numbers exactly.
-jobs_done: map written jobs to the allowed values (Oil change -> Engine oil change).
-customer_requests: the CUSTOMER DEMANDED lines. Ignore signatures and stamps."""
+PROMPT = """Scanned Arul Motors Yamaha job card, 2 pages, partly handwritten. Fill only what
+is written, circled or ticked; blank or unreadable = null/[]. Never guess. Ignore printed
+labels, the pre-service checklist, bike pictures, customer details, and signatures or
+dates scrawled diagonally across the tables.
+
+PAGE 1 (top to bottom):
+- Top margin above the header: a handwritten 17-character code starting "ME1" = frame_number.
+- Header, beside YAMAHA "CARD No.": the printed red number = job_card_no.
+- First row of boxes, left to right: Vehicle Model | Vehicle Reg. No. = registration_number |
+  Odometer Reading = odometer_km | Vehicle Receiving Date = received_date | Ready for delivery (estimate, ignore).
+- "TYPE OF JOB" row: the circled/underlined choice = job_type (FREE SERVICE [1-2-3...] = Free service,
+  PAID SERVICE, ACCIDENTAL = Accidental, QUICK (Minor) REPAIR, WARRANTY REPAIR).
+- Left column "CUSTOMER DEMANDED REPAIRS/OBSERVATION": the handwritten lines = customer_requests
+  (one line each, joined with ", "); also map them to jobs_done.
+- "SUPERVISOR OBSERVATION" list (Water Wash ... Consumables): items ticked or with a value = jobs_done.
+- Bottom: ALLOTED BAY NO./TECHNICIAN NAME = technician, MECHANIC NAME = mechanic,
+  SUPERVISOR'S SIGN (a written name only) = supervisor; bottom-right "Frame No" / "Engine No"
+  = frame_number (if not at the top) / engine_number; "Ready for delivery Date" = delivered_date.
+
+PAGE 2:
+- Top-left "PARTS REPLACED / REPAIRED" table: each written row = a part (PART No. = part_no,
+  PART NAME = name, QTY = qty, Rs. = amount). Top-right "LABOUR" table: rows = labour.
+- Middle-left "UNDER WARRANTY" table: rows with a part name = parts with warranty=true.
+  A number alone in its Rs. column with no part name is the bill total = total_amount.
+- "TOTAL" / "G.TOTAL" boxes = total_amount.
+- "STANDARD CHECK AT THE TIME OF DELIVERY" boxes: ticked ones = delivery_checks.
+- "REMARKS" line = remarks.
+- "CUSTOMER FEEDBACK" row: the ticked/circled rating, then DELIVERY ON TIME YES/NO, WASHING QUALITY,
+  STAFF BEHAVIOUR, FAIRNESS OF CHARGES, REPAIRING QUALITY (OK=true, NOT OK=false);
+  REPLACED PARTS HANDOVER YES = delivery check "Replaced parts handed over".
+- Delivery certificate "Date" at the bottom = delivered_date if page 1 has none.
+
+Dates are DD/MM/YY. Amounts in whole rupees. Copy part, frame and registration numbers exactly
+(letters and digits as written, no spaces). jobs_done uses only the allowed values
+(Oil change -> Engine oil change, General checkup -> General check-up)."""
 
 _client: genai.Client | None = None
 
