@@ -1154,6 +1154,52 @@ def test_close_service_with_job_card_moves_bike_on_and_keeps_history(db, monkeyp
     assert db.get_service_document(record_id) is None and db.list_service_records() == []
 
 
+def test_job_card_extract_fills_the_form_without_saving(db, monkeypatch):
+    """Upload a job card -> Gemini's JSON comes back as form fields; bad dates
+    are dropped; failures are a clear 502; nothing is written."""
+    import json
+    from types import SimpleNamespace
+
+    import job_card_extract
+
+    reply = {
+        "job_card_no": "6862", "job_type": "Free service", "odometer_km": 3158,
+        "received_date": "2026-10-23", "delivered_date": "2026-13-45",  # unreadable -> dropped
+        "frame_number": "ME1RG3719S0016932", "customer_requests": "Oil change, water wash",
+        "jobs_done": ["Engine oil change", "Water wash"],
+        "parts": [{"part_no": "90793-AD411", "name": "Engine oil", "qty": 1, "amount": 737, "warranty": False}],
+        "labour": [], "delivery_checks": [], "feedback": {"rating": "Good"}, "total_amount": 1196,
+    }
+    calls = []
+
+    class FakeModels:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(text=json.dumps(reply), usage_metadata=None)
+
+    monkeypatch.setattr(job_card_extract, "_get_client", lambda: SimpleNamespace(models=FakeModels()))
+    client = _api_client(monkeypatch, admin=False)
+    r = client.post("/api/job-card/extract", files={"report": ("card.pdf", PDF, "application/pdf")})
+    assert r.status_code == 200, r.text
+    card = r.json()
+    assert card["job_card_no"] == "6862" and card["odometer_km"] == 3158 and card["job_type"] == "Free service"
+    assert card["received_date"] == "2026-10-23" and card["delivered_date"] is None
+    assert card["parts"][0]["part_no"] == "90793-AD411" and card["jobs_done"] == ["Engine oil change", "Water wash"]
+    assert card["feedback"]["rating"] == "Good" and card["total_amount"] == 1196
+    assert calls[0]["model"] == job_card_extract.EXTRACT_MODEL
+    assert db.list_service_records() == []  # nothing saved
+
+    assert client.post("/api/job-card/extract", files={"report": ("x.pdf", b"nope", "application/pdf")}).status_code == 400
+
+    class Broken:
+        def generate_content(self, **kwargs):
+            raise TimeoutError("vertex down")
+
+    monkeypatch.setattr(job_card_extract, "_get_client", lambda: SimpleNamespace(models=Broken()))
+    r = client.post("/api/job-card/extract", files={"report": ("card.pdf", PDF, "application/pdf")})
+    assert r.status_code == 502 and "by hand" in r.json()["detail"]
+
+
 def test_service_type_overdue_days_decide_when_a_bike_is_overdue(db, monkeypatch):
     """Each service type has its own overdue days: a bike due 10 days ago is
     still 'due' for a 30-day type, but overdue for a 5-day (or 0-day) type."""

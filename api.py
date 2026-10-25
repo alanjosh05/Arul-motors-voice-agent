@@ -47,6 +47,7 @@ from pydantic import BaseModel
 import auth
 import crm_export
 import database
+import job_card_extract
 
 # import dialer  # Plivo disabled — pending client decision on telephony
 
@@ -726,6 +727,19 @@ def close_service(
     if not ok:
         raise HTTPException(status_code=404 if message.startswith("No open booking") else 400, detail=message)
     return {"message": message, "id": record_id}
+
+
+@api.post("/job-card/extract")
+def extract_job_card(report: UploadFile = File(..., description="Scanned job card (PDF)")):
+    """Read a scanned job card with Gemini and return its fields to pre-fill
+    "Close service". Nothing is saved: staff check the form, then close."""
+    pdf = report.file.read(database.MAX_PDF_BYTES + 1)
+    try:
+        return job_card_extract.extract_job_card(pdf)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
 
 
 @api.get("/vehicles/{vehicle_id}/service-history")
