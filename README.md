@@ -156,10 +156,16 @@ booking இருக்கா?". Every filter is optional and they combine:
   number. Otherwise the agent is told matches are hidden and asks for one.
   Mobile numbers are never read back. Search is read-only for other
   customers' bookings.
-- **Service history:** each bike's last service is recorded once as a
-  `COMPLETED` booking (from `last_service_date`). When the workshop finishes a
-  job, `POST /api/appointments/{id}/complete` marks it completed, updates the
-  bike's last service date and, optionally, sets its next due service.
+- **Maintenance records:** booking → service → **Close service** (CRM). Staff
+  record the service date, service done, odometer, work done (plus optional
+  parts, amount, technician, remarks) and upload the **service report PDF**
+  (required, ≤ 10 MB). `POST /api/appointments/{id}/close` (multipart) saves a
+  `service_records` row and the PDF as a BLOB in `service_documents`, marks the
+  booking `COMPLETED`, and moves the bike on (last service date, odometer, next
+  due service), all in one transaction. A bike's history:
+  `GET /api/vehicles/{id}/service-history` (records, plus older completed
+  bookings such as the client import); the PDF: `GET /api/service-records/{id}/report`.
+  The older `POST /api/appointments/{id}/complete` (no record) still works for scripts.
 
 ### Rules (`database.py`)
 
@@ -286,7 +292,10 @@ Scripts may use `X-API-Key: <API_KEY>` instead.
 | `/api/service-types/{id}/move?direction=up\|down` | POST | Reorder the schedule |
 | `/api/appointments?state=&customer_id=` | GET · POST | Bookings (newest first, each with `state`) · book a date for a customer's bike |
 | `/api/appointments/{id}` | GET · PATCH | One booking · reschedule / change notes |
-| `/api/appointments/{id}/cancel` · `/complete` | POST | Cancel · workshop marks serviced (optional next due date/type) |
+| `/api/appointments/{id}/cancel` · `/complete` | POST | Cancel (deletes it) · mark serviced without a record (scripts) |
+| `/api/appointments/{id}/close` | POST | Close service: multipart form with the details and `report` (PDF ≤ 10 MB) |
+| `/api/vehicles/{id}/service-history` | GET | A bike's maintenance records and older services, newest first |
+| `/api/service-records/{id}/report` | GET | The service report PDF (inline) |
 | `/api/appointments/search?…` | GET | Fuzzy booking search (same matching as the voice tool) |
 | `/api/calls?customer_id=` · `/api/calls/log` | GET · POST | Call log · record a call made by staff |
 | `/api/voice/config` · `/api/voice/status` | GET | ICE servers for the call panel · whether the bot is reachable |

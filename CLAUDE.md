@@ -163,6 +163,9 @@ enabled:
   tests against MySQL as well (see README).
 
 - No raw call audio is written to disk; only tool-captured structured outcomes are stored.
+- Maintenance records (`service_records`) are written only by "Close service" (with a required
+  report PDF, stored as a BLOB in `service_documents`, kept out of list queries). Deleting a bike
+  or customer deletes its records and PDFs. PDFs make the database (and its nightly backups) grow.
 - The agent never invents dates, service history or details not in the
   database. It asks for the date only; there are no time slots.
 - "Today" (IST) and the next 14 dates are put in the prompt at call start (`_today_line`), not

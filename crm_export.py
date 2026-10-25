@@ -1,7 +1,8 @@
 """Excel export of the CRM (Settings > Data & backups > Export to Excel).
 
-Four sheets the showroom can filter and work on: Customers & Bikes (one row
-per bike), Bookings, Calls and Service Types. Dates are real Excel dates and
+Five sheets the showroom can filter and work on: Customers & Bikes (one row
+per bike), Service Records (what was done at each service), Bookings, Calls
+and Service Types. Service report PDFs stay in the CRM. Dates are real Excel dates and
 mobile numbers stay text.
 """
 
@@ -104,6 +105,19 @@ def build_workbook() -> bytes:
         ("Next service type", 22, None), ("Next booking", 13, DAY), ("Last call", 16, DAY_TIME),
         ("Last call outcome", 17, None),
     ], bike_rows)
+
+    _sheet(wb, "Service Records", [
+        ("Service date", 13, DAY), ("Customer", 24, None), ("Mobile", 13, "@"), ("Bike model", 30, None),
+        ("Registration", 15, None), ("Service", 22, None), ("Odometer (km)", 13, "#,##0"), ("Work done", 50, None),
+        ("Parts", 35, None), ("Amount (₹)", 11, "#,##0"), ("Technician", 16, None), ("Remarks", 35, None),
+        ("Next service", 13, DAY), ("Next service type", 22, None), ("Report PDF", 26, None), ("Closed by", 16, None),
+    ], [
+        [_day(r["service_date"]), r["customer_name"], r["mobile_number"], r["model"], r["registration_number"],
+         r["service_type"], r["odometer_km"], r["work_done"], r["parts"] or "", r["amount"], r["technician"] or "",
+         r["remarks"] or "", _day(r["next_service_date"]), r["next_service_type"] or "", r["document_name"] or "",
+         r["created_by"] or ""]
+        for r in database.list_service_records()
+    ])
 
     bookings = database.search_appointments()
     _sheet(wb, "Bookings", [

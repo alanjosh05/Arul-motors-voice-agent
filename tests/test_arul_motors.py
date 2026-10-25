@@ -976,7 +976,7 @@ def test_admin_excel_export_and_database_backup(db, monkeypatch, tmp_path):
     assert r.status_code == 200 and "spreadsheetml" in r.headers["content-type"]
     assert "attachment" in r.headers["content-disposition"]
     wb = load_workbook(io.BytesIO(r.content))
-    assert wb.sheetnames == ["Customers & Bikes", "Bookings", "Calls", "Service Types"]
+    assert wb.sheetnames == ["Customers & Bikes", "Service Records", "Bookings", "Calls", "Service Types"]
     bikes = list(wb["Customers & Bikes"].iter_rows(values_only=True))
     assert bikes[0][:3] == ("Customer", "Mobile", "Alternate mobile") and len(bikes) == 5
     karthik = next(row for row in bikes if row[0] == "Karthik Raja")
@@ -1046,3 +1046,65 @@ def test_cancel_removes_the_call_that_booked_it(db):
     assert [c["outcome"] for c in db.get_call_logs(1)] == ["no_answer"]
     assert not db.event_ref_exists(f"booking:{aid}")
     assert next(c for c in db.list_customers() if c["id"] == 1)["last_call"]["outcome"] == "no_answer"
+
+
+PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
+
+
+def test_close_service_with_report_moves_bike_on_and_keeps_history(db, monkeypatch):
+    """Book -> close the service (details + PDF) -> bike moves to its next
+    service; the record and PDF show in the bike's history."""
+    client = _api_client(monkeypatch, admin=False)  # any staff can close services
+    karthik = db.get_customer_by_mobile("9876543210")
+    bike = karthik["vehicles"][0]
+    aid = client.post("/api/appointments", json={"customer_id": karthik["id"], "appointment_date": days_ahead(1)}).json()["id"]
+    today = db.today().isoformat()
+    form = {
+        "service_date": today, "service_type": "First free service", "odometer_km": "1180",
+        "work_done": "Oil change, chain lube, brake adjust", "parts": "Oil filter", "amount": "0",
+        "technician": "Ravi", "remarks": "Rear brake noise checked",
+        "next_service_date": days_ahead(90), "next_service_type": "Second free service",
+    }
+    pdf = {"report": ("Job card 12.pdf", PDF, "application/pdf")}
+    url = f"/api/appointments/{aid}/close"
+
+    # Validation: PDF required and must be a PDF; no future dates; next after this one.
+    assert client.post(url, data=form).status_code == 422  # no file at all
+    assert client.post(url, data=form, files={"report": ("x.pdf", b"not a pdf", "application/pdf")}).status_code == 400
+    big = b"%PDF" + b"0" * db.MAX_PDF_BYTES
+    assert client.post(url, data=form, files={"report": ("big.pdf", big, "application/pdf")}).status_code == 400
+    assert client.post(url, data={**form, "service_date": days_ahead(2)}, files=pdf).status_code == 400
+    assert client.post(url, data={**form, "next_service_date": today}, files=pdf).status_code == 400
+    assert client.post(url, data={**form, "work_done": " "}, files=pdf).status_code == 400
+    assert client.post("/api/appointments/AM9999/close", data=form, files=pdf).status_code == 404
+    assert db.get_appointment(aid)["status"] == "CONFIRMED"  # nothing half-saved
+
+    r = client.post(url, data=form, files=pdf)
+    assert r.status_code == 201, r.text
+    record_id = r.json()["id"]
+
+    # Booking closed, bike moved on.
+    assert db.get_appointment(aid)["status"] == "COMPLETED"
+    v = next(x for x in db.get_customer(karthik["id"])["vehicles"] if x["id"] == bike["id"])
+    assert (v["last_service_date"], v["odometer_km"]) == (today, 1180)
+    assert (v["next_service_date"], v["next_service_type"]) == (days_ahead(90), "Second free service")
+    assert client.post(url, data=form, files=pdf).status_code == 404  # can't close twice
+
+    # History under the bike, newest first, with the report.
+    history = client.get(f"/api/vehicles/{bike['id']}/service-history").json()
+    assert history[0]["kind"] == "record" and history[0]["work_done"].startswith("Oil change")
+    assert history[0]["document_name"] == "Job card 12.pdf" and history[0]["document_size"] == len(PDF)
+    assert history[0]["created_by"] == "Test staff"
+    report = client.get(f"/api/service-records/{record_id}/report")
+    assert report.status_code == 200 and report.content == PDF
+    assert report.headers["content-type"] == "application/pdf" and "inline" in report.headers["content-disposition"]
+    assert client.get("/api/service-records/9999/report").status_code == 404
+
+    # Older services without a record (e.g. imported) are listed too.
+    priya = db.get_customer_by_mobile("9876501234")
+    older = client.get(f"/api/vehicles/{priya['vehicles'][0]['id']}/service-history").json()
+    assert older and older[0]["kind"] == "booking"
+
+    # Deleting the bike removes its records and PDFs.
+    assert db.delete_vehicle(bike["id"])[0]
+    assert db.get_service_document(record_id) is None and db.list_service_records() == []

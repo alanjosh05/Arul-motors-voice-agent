@@ -25,7 +25,20 @@ from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response
@@ -649,6 +662,70 @@ def complete_appointment(appointment_id: str, body: CompleteIn | None = None):
     return _check(
         database.complete_appointment(appointment_id, body.next_service_date, body.next_service_type),
         not_found=True,
+    )
+
+
+@api.post("/appointments/{appointment_id}/close", status_code=201)
+def close_service(
+    appointment_id: str,
+    service_date: str = Form(...),
+    work_done: str = Form(...),
+    report: UploadFile = File(..., description="Service report PDF"),
+    service_type: str | None = Form(None),
+    odometer_km: int | None = Form(None),
+    parts: str | None = Form(None),
+    amount: int | None = Form(None),
+    technician: str | None = Form(None),
+    remarks: str | None = Form(None),
+    next_service_date: str | None = Form(None),
+    next_service_type: str | None = Form(None),
+    user: dict = Depends(current_user),
+):
+    """Workshop: close a booking with what was done and the service report PDF
+    (multipart form). Saves the maintenance record and moves the bike on to its
+    next service."""
+    pdf = report.file.read(database.MAX_PDF_BYTES + 1)  # one byte over = too big
+    ok, message, record_id = database.close_service(
+        appointment_id,
+        service_date=service_date,
+        service_type=service_type,
+        odometer_km=odometer_km,
+        work_done=work_done,
+        pdf=pdf,
+        pdf_name=report.filename,
+        parts=parts,
+        amount=amount,
+        technician=technician,
+        remarks=remarks,
+        next_service_date=next_service_date,
+        next_service_type=next_service_type,
+        actor=user.get("full_name") or user["username"],
+    )
+    if not ok:
+        status = 404 if message.startswith("No open booking") else 400
+        raise HTTPException(status_code=status, detail=message)
+    return {"message": message, "id": record_id}
+
+
+@api.get("/vehicles/{vehicle_id}/service-history")
+def service_history(vehicle_id: int):
+    """A bike's maintenance records (and older completed services), newest first."""
+    return database.get_service_history(vehicle_id)
+
+
+@api.get("/service-records/{record_id}/report")
+def service_report(record_id: int):
+    """The service report PDF of a maintenance record (opens in the browser)."""
+    document = database.get_service_document(record_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="No service report for this record.")
+    return Response(
+        document["data"],
+        media_type=document["content_type"],
+        headers={
+            "Content-Disposition": f'inline; filename="{document["filename"]}"',
+            "Cache-Control": "private, no-store",
+        },
     )
 
 

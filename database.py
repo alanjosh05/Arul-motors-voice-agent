@@ -113,6 +113,9 @@ class _MySQLConnection:
     def commit(self):
         self._conn.commit()
 
+    def rollback(self):
+        self._conn.rollback()
+
     def close(self):
         self._conn.close()
 
@@ -168,9 +171,13 @@ def _schema() -> dict:
             "str": "VARCHAR(100)",
             "day": "VARCHAR(10)",
             "id": "VARCHAR(20)",
+            "blob": "LONGBLOB",
             "table": "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
         }
-    return {"pk": "INTEGER PRIMARY KEY AUTOINCREMENT", "str": "TEXT", "day": "TEXT", "id": "TEXT", "table": ""}
+    return {
+        "pk": "INTEGER PRIMARY KEY AUTOINCREMENT", "str": "TEXT", "day": "TEXT", "id": "TEXT",
+        "blob": "BLOB", "table": "",
+    }
 
 
 def _plain(row) -> dict:
@@ -225,6 +232,8 @@ INDEXES = [
     ("ix_events_type", "events", "type, id"),
     ("ix_events_ref", "events", "event_ref"),
     ("ix_voice_calls_open", "voice_calls", "ended_at, started_at"),
+    ("ix_service_records_vehicle", "service_records", "vehicle_id, service_date"),
+    ("ix_service_records_customer", "service_records", "customer_id"),
 ]
 
 
@@ -355,6 +364,43 @@ def init_db():
         type {t['str']} NOT NULL,
         event_ref {t['str']},
         payload TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) {t['table']}
+    """)
+
+    # Maintenance records: what was done at each service, written when staff
+    # close a booking ("Close service"). One per booking.
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS service_records (
+        id {t['pk']},
+        appointment_id {t['id']} UNIQUE,
+        vehicle_id INTEGER NOT NULL,
+        customer_id INTEGER NOT NULL,
+        service_date {t['day']} NOT NULL,
+        service_type {t['str']} NOT NULL,
+        odometer_km INTEGER,
+        work_done TEXT NOT NULL,
+        parts TEXT,
+        amount INTEGER,
+        technician {t['str']},
+        remarks TEXT,
+        next_service_date {t['day']},
+        next_service_type {t['str']},
+        created_by {t['str']},
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) {t['table']}
+    """)
+
+    # The service report PDF for each record, as a BLOB. A separate table so
+    # lists and history never read the file; only "View PDF" does.
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS service_documents (
+        id {t['pk']},
+        record_id INTEGER NOT NULL UNIQUE,
+        filename {t['str']} NOT NULL,
+        content_type {t['str']} NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        data {t['blob']} NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) {t['table']}
     """)
@@ -928,6 +974,178 @@ def complete_appointment(
 
 
 # ---------------------------------------------------------------------------
+# Maintenance records ("Close service")
+# ---------------------------------------------------------------------------
+MAX_PDF_BYTES = 10 * 1024 * 1024  # service report upload limit (10 MB)
+
+
+def _clean_text(value: str | None, limit: int = 2000) -> str | None:
+    value = (value or "").strip()
+    return value[:limit] or None
+
+
+def close_service(
+    appointment_id: str,
+    *,
+    service_date: str | None,
+    service_type: str | None,
+    odometer_km: int | None,
+    work_done: str | None,
+    pdf: bytes | None,
+    pdf_name: str | None,
+    parts: str | None = None,
+    amount: int | None = None,
+    technician: str | None = None,
+    remarks: str | None = None,
+    next_service_date: str | None = None,
+    next_service_type: str | None = None,
+    actor: str | None = None,
+) -> tuple[bool, str, int | None]:
+    """Close a booking with what was done: saves a maintenance record and its
+    service report PDF, marks the booking COMPLETED, and moves the bike on
+    (last service date, odometer, next due service). All in one transaction.
+    Returns (ok, message, record_id)."""
+    day = normalize_date(service_date)
+    if not day:
+        return (False, "Enter the date the service was done.", None)
+    if day > today().isoformat():
+        return (False, "The service date can't be in the future.", None)
+    work_done = _clean_text(work_done)
+    if not work_done:
+        return (False, "Describe the work done.", None)
+    if odometer_km is not None and odometer_km < 0:
+        return (False, "Odometer must be 0 or more.", None)
+    if amount is not None and amount < 0:
+        return (False, "Amount must be 0 or more.", None)
+    if not pdf:
+        return (False, "Attach the service report (PDF).", None)
+    if len(pdf) > MAX_PDF_BYTES:
+        return (False, f"The PDF is larger than {MAX_PDF_BYTES // (1024 * 1024)} MB.", None)
+    if not pdf.startswith(b"%PDF"):
+        return (False, "The service report must be a PDF file.", None)
+    next_due = normalize_date(next_service_date) if next_service_date else None
+    if next_service_date and not next_due:
+        return (False, "Invalid next service date.", None)
+    if next_due and next_due <= day:
+        return (False, "The next service must be after this service.", None)
+    if next_due and not (next_service_type or "").strip():
+        return (False, "Choose the next service type.", None)
+
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM service_appointments WHERE UPPER(id) = UPPER(?) AND status = 'CONFIRMED'",
+        ((appointment_id or "").strip(),),
+    )
+    booking = cursor.fetchone()
+    if not booking:
+        conn.close()
+        return (False, f"No open booking with ID {appointment_id}.", None)
+    service_type = (service_type or "").strip() or booking["service_type"]
+    filename = re.sub(r"[^\w.\- ]", "_", (pdf_name or "service-report.pdf").strip())[:80] or "service-report.pdf"
+    if not filename.lower().endswith(".pdf"):
+        filename += ".pdf"
+    try:
+        cursor.execute(
+            """
+        INSERT INTO service_records (appointment_id, vehicle_id, customer_id, service_date, service_type,
+            odometer_km, work_done, parts, amount, technician, remarks, next_service_date, next_service_type, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            (
+                booking["id"], booking["vehicle_id"], booking["customer_id"], day, service_type,
+                odometer_km, work_done, _clean_text(parts), amount, _clean_text(technician, 100),
+                _clean_text(remarks), next_due, (next_service_type or "").strip() or None, actor,
+            ),
+        )
+        record_id = cursor.lastrowid
+        cursor.execute(
+            "INSERT INTO service_documents (record_id, filename, content_type, size_bytes, data) VALUES (?, ?, ?, ?, ?)",
+            (record_id, filename, "application/pdf", len(pdf), pdf),
+        )
+        cursor.execute("UPDATE service_appointments SET status = 'COMPLETED' WHERE id = ?", (booking["id"],))
+        cursor.execute("UPDATE vehicles SET last_service_date = ? WHERE id = ?", (day, booking["vehicle_id"]))
+        if odometer_km is not None:
+            cursor.execute("UPDATE vehicles SET odometer_km = ? WHERE id = ?", (odometer_km, booking["vehicle_id"]))
+        if next_due:
+            cursor.execute(
+                "UPDATE vehicles SET next_service_date = ?, next_service_type = ? WHERE id = ?",
+                (next_due, next_service_type.strip(), booking["vehicle_id"]),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+    _record_change(BOOKING_ENTITIES + ["vehicles", "service_records"], booking["customer_id"])
+    return (True, f"Service closed for booking {booking['id']}.", record_id)
+
+
+def get_service_history(vehicle_id: int) -> list:
+    """A bike's service history, newest first: maintenance records (with their
+    PDF's name and size) and, for older services without a record (e.g. the
+    client's import), the completed booking itself (kind 'booking')."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    SELECT r.*, d.filename AS document_name, d.size_bytes AS document_size
+    FROM service_records r LEFT JOIN service_documents d ON d.record_id = r.id
+    WHERE r.vehicle_id = ?
+    """,
+        (vehicle_id,),
+    )
+    records = [{"kind": "record", **_plain(r)} for r in cursor.fetchall()]
+    cursor.execute(
+        """
+    SELECT a.id AS appointment_id, a.appointment_date AS service_date, a.service_type, a.notes AS remarks
+    FROM service_appointments a
+    WHERE a.vehicle_id = ? AND a.status = 'COMPLETED'
+      AND NOT EXISTS (SELECT 1 FROM service_records r WHERE r.appointment_id = a.id)
+    """,
+        (vehicle_id,),
+    )
+    older = [{"kind": "booking", **_plain(r)} for r in cursor.fetchall()]
+    conn.close()
+    return sorted(records + older, key=lambda r: (r["service_date"], r.get("id") or 0), reverse=True)
+
+
+def list_service_records() -> list:
+    """Every maintenance record with its customer and bike, newest first (no PDFs)."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    SELECT r.*, c.name AS customer_name, c.mobile_number, v.model, v.registration_number,
+           d.filename AS document_name
+    FROM service_records r
+    JOIN customers c ON c.id = r.customer_id
+    JOIN vehicles v ON v.id = r.vehicle_id
+    LEFT JOIN service_documents d ON d.record_id = r.id
+    ORDER BY r.service_date DESC, r.id DESC
+    """
+    )
+    rows = [_plain(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_service_document(record_id: int) -> dict | None:
+    """The service report PDF of a record: {filename, content_type, data}."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT filename, content_type, data FROM service_documents WHERE record_id = ?", (record_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"filename": row["filename"], "content_type": row["content_type"], "data": bytes(row["data"])}
+
+
+# ---------------------------------------------------------------------------
 # Search (previous and upcoming service bookings)
 # ---------------------------------------------------------------------------
 def _alnum(text: str | None) -> str:
@@ -1282,7 +1500,11 @@ def delete_customer(customer_id: int) -> tuple[bool, str]:
         return (False, "Customer not found.")
     conn = _connect()
     cursor = conn.cursor()
-    for table in ("call_logs", "service_appointments", "vehicles"):
+    cursor.execute(
+        "DELETE FROM service_documents WHERE record_id IN (SELECT id FROM service_records WHERE customer_id = ?)",
+        (customer_id,),
+    )
+    for table in ("service_records", "call_logs", "service_appointments", "vehicles"):
         cursor.execute(f"DELETE FROM {table} WHERE customer_id = ?", (customer_id,))
     cursor.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
     conn.commit()
@@ -1345,13 +1567,19 @@ def update_vehicle(vehicle_id: int, **changes) -> tuple[bool, str]:
 
 
 def delete_vehicle(vehicle_id: int) -> tuple[bool, str]:
-    """Delete a bike with its bookings; its call logs are kept without the bike link."""
+    """Delete a bike with its bookings and service records (and their PDFs); its
+    call logs are kept without the bike link."""
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM vehicles WHERE id = ?", (vehicle_id,))
     if not cursor.fetchone():
         conn.close()
         return (False, "Bike not found.")
+    cursor.execute(
+        "DELETE FROM service_documents WHERE record_id IN (SELECT id FROM service_records WHERE vehicle_id = ?)",
+        (vehicle_id,),
+    )
+    cursor.execute("DELETE FROM service_records WHERE vehicle_id = ?", (vehicle_id,))
     cursor.execute("DELETE FROM service_appointments WHERE vehicle_id = ?", (vehicle_id,))
     cursor.execute("UPDATE call_logs SET vehicle_id = NULL WHERE vehicle_id = ?", (vehicle_id,))
     cursor.execute("DELETE FROM vehicles WHERE id = ?", (vehicle_id,))
