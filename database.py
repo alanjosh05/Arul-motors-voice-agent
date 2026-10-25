@@ -1545,6 +1545,39 @@ def get_call_logs(
     return rows
 
 
+def delete_call_log(call_id: int) -> tuple[bool, str]:
+    """Delete one call log entry (admins, from the Call log)."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT customer_id FROM call_logs WHERE id = ?", (call_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return (False, "Call not found.")
+    cursor.execute("DELETE FROM call_logs WHERE id = ?", (call_id,))
+    conn.commit()
+    conn.close()
+    _record_change(["calls", "customers", "stats"], row["customer_id"])
+    return (True, "Call deleted.")
+
+
+def delete_call_logs(outcome: str | None = None) -> tuple[bool, str, int]:
+    """Delete every call log entry, or only those with `outcome` (admins)."""
+    if outcome is not None and outcome not in CALL_OUTCOMES:
+        return (False, f"Unknown outcome '{outcome}'.", 0)
+    conn = _connect()
+    cursor = conn.cursor()
+    if outcome:
+        cursor.execute("DELETE FROM call_logs WHERE outcome = ?", (outcome,))
+    else:
+        cursor.execute("DELETE FROM call_logs")
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    _record_change(["calls", "customers", "stats"])
+    return (True, f"{deleted} call{'s' if deleted != 1 else ''} deleted.", deleted)
+
+
 def count_call_logs() -> int:
     conn = _connect()
     cursor = conn.cursor()

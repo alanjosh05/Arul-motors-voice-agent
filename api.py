@@ -806,6 +806,21 @@ def get_calls(customer_id: int | None = None, limit: int = Query(default=CALL_LO
     return database.get_call_logs(customer_id, limit=limit)
 
 
+@api.delete("/calls/{call_id}", dependencies=[Depends(admin_user)])
+def delete_call(call_id: int):
+    """Admins: delete one call log entry."""
+    return _check(database.delete_call_log(call_id), not_found=True)
+
+
+@api.delete("/calls", dependencies=[Depends(admin_user)])
+def delete_calls(outcome: str | None = None):
+    """Admins: delete every call log entry, or only those with `outcome`."""
+    ok, message, deleted = database.delete_call_logs(outcome)
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {"message": message, "deleted": deleted}
+
+
 @api.get("/call-outcomes")
 def get_call_outcomes():
     return sorted(database.CALL_OUTCOMES)

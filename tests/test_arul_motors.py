@@ -1283,3 +1283,26 @@ def test_out_of_shift_hours_only_admins(db, monkeypatch):
         with TestClient(api.app).websocket_connect(f"/api/ws?token={token}") as ws:
             ws.receive_text()
     assert closed.value.code == 4403
+
+
+def test_admin_deletes_calls_one_or_all(db, monkeypatch):
+    """Call log: admins delete one entry, all of one outcome, or everything;
+    staff can't; the customer's last call follows."""
+    admin = _api_client(monkeypatch)
+    staff = _api_client(monkeypatch, admin=False)
+    for outcome in ("no_answer", "no_answer", "callback_requested", "date_confirmed"):
+        db.log_call(1, outcome)
+    calls = admin.get("/api/calls").json()
+    assert len(calls) == 4
+
+    assert staff.delete(f"/api/calls/{calls[0]['id']}").status_code == 403
+    assert staff.delete("/api/calls").status_code == 403
+    assert admin.delete(f"/api/calls/{calls[0]['id']}").status_code == 200  # newest: date_confirmed
+    assert admin.delete(f"/api/calls/{calls[0]['id']}").status_code == 404
+    assert next(c for c in db.list_customers() if c["id"] == 1)["last_call"]["outcome"] == "callback_requested"
+
+    assert admin.delete("/api/calls", params={"outcome": "bogus"}).status_code == 400
+    r = admin.delete("/api/calls", params={"outcome": "no_answer"})
+    assert r.json()["deleted"] == 2 and [c["outcome"] for c in admin.get("/api/calls").json()] == ["callback_requested"]
+    assert admin.delete("/api/calls").json()["deleted"] == 1
+    assert admin.get("/api/calls/count").json()["total"] == 0
