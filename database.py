@@ -461,6 +461,12 @@ def init_db():
     # date is then often unknown, and the first visit can be any service.
     _ensure_column(cursor, "vehicles", "bought_elsewhere", "INTEGER DEFAULT 0")
     _ensure_column(cursor, "vehicles", "dealer_name", t["str"])
+    # The next service's date is fixed only at the visit where the engine oil is
+    # changed: until then it's "after the oil change" (left out of due lists).
+    _ensure_column(cursor, "vehicles", "next_due_pending", "INTEGER DEFAULT 0")
+    # How a record changed the bike's schedule: set (default) / pending (next
+    # service after the oil change) / keep (a repair: schedule unchanged).
+    _ensure_column(cursor, "service_records", "schedule", t["str"])
 
     # The service report PDF for each record, as a BLOB. A separate table so
     # lists and history never read the file; only "View PDF" does.
@@ -717,6 +723,7 @@ def get_due_services(within_days: int = 7) -> list:
            v.registration_number, v.model, v.next_service_date, v.next_service_type
     FROM vehicles v JOIN customers c ON c.id = v.customer_id
     WHERE v.next_service_date <= ?
+      AND COALESCE(v.next_due_pending, 0) = 0
       AND NOT EXISTS (
         SELECT 1 FROM service_appointments a WHERE a.vehicle_id = v.id AND a.status = 'CONFIRMED'
       )
@@ -1085,6 +1092,13 @@ MAX_PDF_BYTES = 10 * 1024 * 1024  # job card / service report upload limit (10 M
 
 # From the Arul Motors Yamaha job card.
 JOB_TYPES = ["Free service", "Paid service", "Accidental", "Quick repair", "Warranty repair"]
+# What a recorded visit does to the bike's service schedule:
+# set     - fixes the next service (type and date), as usual;
+# pending - the engine oil wasn't changed: the next service's type is known,
+#           its date is fixed at the visit where the oil is changed;
+# keep    - a repair (e.g. after an accident): the schedule doesn't change.
+SCHEDULE_CHOICES = ("set", "pending", "keep")
+DEFAULT_INTERVAL_DAYS = 90
 FEEDBACK_RATINGS = ["Excellent", "Very good", "Good", "Average", "Below expectation"]
 FEEDBACK_CHECKS = ["delivery_on_time", "washing_quality", "staff_behaviour", "fairness_of_charges", "repairing_quality"]
 _JSON_FIELDS = ("jobs_done", "parts", "labour", "delivery_checks", "feedback")
@@ -1224,6 +1238,15 @@ def _clean_job_card(d: dict) -> dict:
     if next_due and next_due <= day:
         raise ValueError("The next service must be after this service.")
     next_type = _clean_text(d.get("next_service_type"), 100)
+    schedule = (d.get("schedule") or "set").strip().lower()
+    if schedule not in SCHEDULE_CHOICES:
+        raise ValueError(f"Next service must be one of: {', '.join(SCHEDULE_CHOICES)}.")
+    if schedule == "pending":
+        if not next_type:
+            raise ValueError("Choose the next service type (its date is set at the oil change).")
+        next_due = None
+    elif schedule == "keep":
+        next_due, next_type = None, None
     if next_due and not next_type:
         raise ValueError("Choose the next service type.")
     parts_total = sum(p["qty"] * p["amount"] for p in parts if not p["warranty"])
@@ -1252,7 +1275,8 @@ def _clean_job_card(d: dict) -> dict:
         "supervisor": _clean_text(d.get("supervisor"), 100),
         "remarks": _clean_text(d.get("remarks")),
         "next_service_date": next_due,
-        "next_service_type": next_type if next_due else None,
+        "next_service_type": next_type if next_due or schedule == "pending" else None,
+        "schedule": schedule,
     }
 
 
@@ -1271,19 +1295,49 @@ def _pdf_filename(name: str | None) -> str:
 
 
 # What closing a service changes on the bike (and deleting the record restores).
-BIKE_STATE = ("last_service_date", "next_service_date", "next_service_type", "odometer_km", "frame_number", "engine_number")
+BIKE_STATE = ("last_service_date", "next_service_date", "next_service_type", "odometer_km", "frame_number", "engine_number",
+              "next_due_pending")
+# The part of BIKE_STATE that any visit updates (a repair too); the rest is the schedule.
+READING_STATE = ("odometer_km", "frame_number", "engine_number")
 
 
-def _move_bike_on(cursor, vehicle_id: int, rec: dict) -> None:
-    """The bike takes its last service, odometer, frame/engine numbers and next
-    due service from its latest maintenance record."""
-    cursor.execute("UPDATE vehicles SET last_service_date = ? WHERE id = ?", (rec["service_date"], vehicle_id))
-    for column in ("odometer_km", "frame_number", "engine_number"):
-        if rec[column] is not None:
-            cursor.execute(f"UPDATE vehicles SET {column} = ? WHERE id = ?", (rec[column], vehicle_id))
-    if rec["next_service_date"]:
+def _move_bike_on(cursor, vehicle_id: int, record_id: int, rec: dict) -> None:
+    """Update the bike from a saved maintenance record `rec` (id `record_id`):
+    - readings (odometer, frame/engine numbers) if it's the bike's latest record;
+    - its schedule (last service, next service) if it's the latest record that
+      counts as a service: a repair ("keep") never moves the schedule, so a
+      service a few days before an accident still decides the next one.
+    """
+    def latest(where: str = "") -> int | None:
         cursor.execute(
-            "UPDATE vehicles SET next_service_date = ?, next_service_type = ? WHERE id = ?",
+            f"SELECT id FROM service_records WHERE vehicle_id = ? {where} ORDER BY service_date DESC, id DESC LIMIT 1",
+            (vehicle_id,),
+        )
+        row = cursor.fetchone()
+        return row["id"] if row else None
+
+    if latest() == record_id:
+        for column in ("odometer_km", "frame_number", "engine_number"):
+            if rec[column] is not None:
+                cursor.execute(f"UPDATE vehicles SET {column} = ? WHERE id = ?", (rec[column], vehicle_id))
+    schedule = rec.get("schedule") or "set"
+    if schedule == "keep" or latest("AND COALESCE(schedule, 'set') != 'keep'") != record_id:
+        return
+    cursor.execute("UPDATE vehicles SET last_service_date = ? WHERE id = ?", (rec["service_date"], vehicle_id))
+    if schedule == "pending":
+        # The type is known; the date comes at the oil change. Keep an estimate
+        # (the type's interval from this visit), but nothing calls on it.
+        cursor.execute("SELECT interval_days FROM service_types WHERE name = ?", (rec["next_service_type"],))
+        row = cursor.fetchone()
+        days = (row and row["interval_days"]) or DEFAULT_INTERVAL_DAYS
+        estimate = (date.fromisoformat(rec["service_date"]) + timedelta(days=days)).isoformat()
+        cursor.execute(
+            "UPDATE vehicles SET next_service_date = ?, next_service_type = ?, next_due_pending = 1 WHERE id = ?",
+            (estimate, rec["next_service_type"], vehicle_id),
+        )
+    elif rec["next_service_date"]:
+        cursor.execute(
+            "UPDATE vehicles SET next_service_date = ?, next_service_type = ?, next_due_pending = 0 WHERE id = ?",
             (rec["next_service_date"], rec["next_service_type"], vehicle_id),
         )
 
@@ -1334,7 +1388,7 @@ def close_service(appointment_id: str, details: dict, pdf: bytes | None, pdf_nam
             (record_id, _pdf_filename(pdf_name), "application/pdf", len(pdf), pdf),
         )
         cursor.execute("UPDATE service_appointments SET status = 'COMPLETED' WHERE id = ?", (booking["id"],))
-        _move_bike_on(cursor, booking["vehicle_id"], rec)
+        _move_bike_on(cursor, booking["vehicle_id"], record_id, rec)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1392,12 +1446,7 @@ def record_walk_in_service(vehicle_id: int, details: dict, pdf: bytes | None, pd
             (record_id, _pdf_filename(pdf_name), "application/pdf", len(pdf), pdf),
         )
         # An older service typed in afterwards doesn't move the bike back.
-        cursor.execute(
-            "SELECT id FROM service_records WHERE vehicle_id = ? ORDER BY service_date DESC, id DESC LIMIT 1",
-            (vehicle_id,),
-        )
-        if cursor.fetchone()["id"] == record_id:
-            _move_bike_on(cursor, vehicle_id, rec)
+        _move_bike_on(cursor, vehicle_id, record_id, rec)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1439,13 +1488,8 @@ def update_service_record(record_id: int, details: dict, pdf: bytes | None = Non
                 "WHERE record_id = ?",
                 (_pdf_filename(pdf_name), len(pdf), pdf, record_id),
             )
-        # Only the bike's latest record decides its current state.
-        cursor.execute(
-            "SELECT id FROM service_records WHERE vehicle_id = ? ORDER BY service_date DESC, id DESC LIMIT 1",
-            (current["vehicle_id"],),
-        )
-        if cursor.fetchone()["id"] == record_id:
-            _move_bike_on(cursor, current["vehicle_id"], rec)
+        # Only the bike's latest records decide its current state.
+        _move_bike_on(cursor, current["vehicle_id"], record_id, rec)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1481,6 +1525,16 @@ def delete_service_record(record_id: int) -> tuple[bool, str]:
         "SELECT id FROM service_records WHERE vehicle_id = ? ORDER BY service_date DESC, id DESC LIMIT 1", (vehicle_id,)
     )
     latest = cursor.fetchone()["id"] == record_id
+    # Undo only what this record decided: its readings if it's the latest
+    # record, its schedule if it's the latest service (a repair has none).
+    is_repair = (current["schedule"] or "set") == "keep"
+    cursor.execute(
+        "SELECT id FROM service_records WHERE vehicle_id = ? AND COALESCE(schedule, 'set') != 'keep' "
+        "ORDER BY service_date DESC, id DESC LIMIT 1",
+        (vehicle_id,),
+    )
+    row = cursor.fetchone()
+    latest_service = not is_repair and row is not None and row["id"] == record_id
     try:
         cursor.execute("DELETE FROM service_documents WHERE record_id = ?", (record_id,))
         cursor.execute("DELETE FROM service_records WHERE id = ?", (record_id,))
@@ -1488,38 +1542,40 @@ def delete_service_record(record_id: int) -> tuple[bool, str]:
             cursor.execute(
                 "UPDATE service_appointments SET status = 'CONFIRMED' WHERE id = ?", (current["appointment_id"],)
             )
-        if latest:
-            before = json.loads(current["bike_before"]) if current["bike_before"] else None
-            if before:
-                assignments = ", ".join(f"{column} = ?" for column in BIKE_STATE)
-                cursor.execute(
-                    f"UPDATE vehicles SET {assignments} WHERE id = ?", [*(before.get(c) for c in BIKE_STATE), vehicle_id]
-                )
-            else:
-                # Closed before the bike's state was kept: the service it was
-                # booked for is due again; the last service is the previous one.
-                cursor.execute(
-                    "SELECT service_date FROM service_records WHERE vehicle_id = ? ORDER BY service_date DESC, id DESC LIMIT 1",
-                    (vehicle_id,),
-                )
-                previous = cursor.fetchone()
-                cursor.execute(
-                    "SELECT max(appointment_date) AS day FROM service_appointments WHERE vehicle_id = ? AND status = 'COMPLETED'",
-                    (vehicle_id,),
-                )
-                days = [d for d in (previous and previous["service_date"], cursor.fetchone()["day"]) if d]
-                cursor.execute("SELECT last_service_date FROM vehicles WHERE id = ?", (vehicle_id,))
-                last = cursor.fetchone()["last_service_date"]
-                if last == current["service_date"]:
-                    last = max(days) if days else None
-                cursor.execute("SELECT appointment_date, service_type FROM service_appointments WHERE id = ?",
-                               (current["appointment_id"] or "",))
-                booking = cursor.fetchone()
-                cursor.execute(
-                    "UPDATE vehicles SET last_service_date = ?, next_service_date = ?, next_service_type = ? WHERE id = ?",
-                    (last, booking["appointment_date"] if booking else current["service_date"],
-                     booking["service_type"] if booking else current["service_type"], vehicle_id),
-                )
+        before = json.loads(current["bike_before"]) if current["bike_before"] else None
+        if before and (latest or latest_service):
+            columns = [c for c in BIKE_STATE if (c in READING_STATE and latest) or (c not in READING_STATE and latest_service)]
+            assignments = ", ".join(f"{column} = ?" for column in columns)
+            cursor.execute(
+                f"UPDATE vehicles SET {assignments} WHERE id = ?",
+                # Snapshots taken before the pending flag existed: not pending.
+                [*(before.get(c, 0 if c == "next_due_pending" else None) for c in columns), vehicle_id],
+            )
+        elif not before and latest and not is_repair:
+            # Closed before the bike's state was kept: the service it was
+            # booked for is due again; the last service is the previous one.
+            cursor.execute(
+                "SELECT service_date FROM service_records WHERE vehicle_id = ? ORDER BY service_date DESC, id DESC LIMIT 1",
+                (vehicle_id,),
+            )
+            previous = cursor.fetchone()
+            cursor.execute(
+                "SELECT max(appointment_date) AS day FROM service_appointments WHERE vehicle_id = ? AND status = 'COMPLETED'",
+                (vehicle_id,),
+            )
+            days = [d for d in (previous and previous["service_date"], cursor.fetchone()["day"]) if d]
+            cursor.execute("SELECT last_service_date FROM vehicles WHERE id = ?", (vehicle_id,))
+            last = cursor.fetchone()["last_service_date"]
+            if last == current["service_date"]:
+                last = max(days) if days else None
+            cursor.execute("SELECT appointment_date, service_type FROM service_appointments WHERE id = ?",
+                           (current["appointment_id"] or "",))
+            booking = cursor.fetchone()
+            cursor.execute(
+                "UPDATE vehicles SET last_service_date = ?, next_service_date = ?, next_service_type = ? WHERE id = ?",
+                (last, booking["appointment_date"] if booking else current["service_date"],
+                 booking["service_type"] if booking else current["service_type"], vehicle_id),
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -2040,8 +2096,9 @@ def update_vehicle(vehicle_id: int, **changes) -> tuple[bool, str]:
         changes["registration_number"] = changes["registration_number"].strip().upper()
     conn = _connect()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM vehicles WHERE id = ?", (vehicle_id,))
-    if not cursor.fetchone():
+    cursor.execute("SELECT id, next_service_date FROM vehicles WHERE id = ?", (vehicle_id,))
+    current = cursor.fetchone()
+    if not current:
         conn.close()
         return (False, "Bike not found.")
     if "registration_number" in changes:
@@ -2052,6 +2109,8 @@ def update_vehicle(vehicle_id: int, **changes) -> tuple[bool, str]:
         if cursor.fetchone():
             conn.close()
             return (False, f"Bike {changes['registration_number']} already exists.")
+    if changes.get("next_service_date") not in (None, current["next_service_date"]):
+        changes["next_due_pending"] = 0  # a new date typed in by hand is a fixed date
     assignments = ", ".join(f"{key} = ?" for key in changes)
     cursor.execute(f"UPDATE vehicles SET {assignments} WHERE id = ?", (*changes.values(), vehicle_id))
     conn.commit()

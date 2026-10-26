@@ -181,6 +181,15 @@ booking இருக்கா?". Every filter is optional and they combine:
   booking and moves the bike on if it's now the latest service. If the bike has
   an open booking, that booking is closed instead. The agent hears "bought at
   another dealer", so it never says the bike was bought here.
+- **Next service after a visit** (`schedule` on the job card form): **set** the
+  next service (default); **pending**: the engine oil wasn't changed, so only
+  the next service's type is kept and its date is set at the visit where the
+  oil is changed (`vehicles.next_due_pending`: left out of due lists and agent
+  calls until then); **keep**: a repair (e.g. after an accident a few days
+  after a service; the default for Accidental / Quick repair / Warranty jobs),
+  which updates the odometer and frame/engine numbers but not the schedule.
+  The latest record that counts as a service decides the schedule; deleting a
+  record undoes only what it changed.
   The older `POST /api/appointments/{id}/complete` (no record) still works for scripts.
 
 ### Rules (`database.py`)

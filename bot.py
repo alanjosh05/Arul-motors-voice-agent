@@ -236,7 +236,7 @@ def build_system_instruction(customer: dict) -> str:
     Gemini Live re-reads the whole prompt every turn."""
     vehicles = "\n".join(
         f"- {v['model']} {v['registration_number']}: {v['next_service_type']} due "
-        f"{_say_date(v['next_service_date'])}; {_bought(v)}, "
+        f"{'after its next oil change (no date yet)' if v.get('next_due_pending') else _say_date(v['next_service_date'])}; {_bought(v)}, "
         f"~{v['odometer_km'] or 0} km, last service {_say_date(v['last_service_date'])}"
         for v in customer["vehicles"]
     )

@@ -721,6 +721,9 @@ def job_card_form(
     remarks: str | None = Form(None),
     next_service_date: str | None = Form(None),
     next_service_type: str | None = Form(None),
+    schedule: str | None = Form(
+        None, description="set (default) · pending: next date set at the oil change · keep: a repair, schedule unchanged"
+    ),
 ) -> dict:
     """The job card's fields from a multipart form (Close service and its edit)."""
     return {
@@ -732,7 +735,7 @@ def job_card_form(
         "labour": _json_field(labour, "labour"), "delivery_checks": _json_field(delivery_checks, "delivery checks"),
         "feedback": _json_field(feedback, "feedback"),
         "technician": technician, "mechanic": mechanic, "supervisor": supervisor, "remarks": remarks,
-        "next_service_date": next_service_date, "next_service_type": next_service_type,
+        "next_service_date": next_service_date, "next_service_type": next_service_type, "schedule": schedule,
     }
 
 

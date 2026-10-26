@@ -1458,3 +1458,76 @@ def test_bike_bought_elsewhere_walks_in_for_its_third_free_service(db, monkeypat
     assert admin.patch(f"/api/vehicles/{bike['id']}", json={"bought_elsewhere": True, "purchase_date": ""}).status_code == 200
     edited = next(v for v in admin.get("/api/vehicles").json() if v["id"] == bike["id"])
     assert (edited["bought_elsewhere"], edited["purchase_date"]) == (1, None)
+
+
+def test_service_without_oil_change_waits_for_the_oil_change_to_set_the_next_date(db, monkeypatch):
+    """Case 1: serviced, but the engine oil wasn't changed, so the next date
+    can't be fixed. The bike keeps its next service type, drops out of the
+    call list, and the visit where the oil is changed sets the date."""
+    import json
+
+    import bot
+
+    staff = _api_client(monkeypatch, admin=False)
+    karthik = db.get_customer_by_mobile("9876543210")
+    bike_id = karthik["vehicles"][0]["id"]
+    aid = staff.post("/api/appointments", json={"customer_id": karthik["id"], "appointment_date": days_ahead(1)}).json()["id"]
+    pdf = {"report": ("a.pdf", PDF, "application/pdf")}
+    first = {"service_date": days_ahead(-7), "service_type": "First free service", "odometer_km": "1000",
+             "jobs_done": json.dumps(["Water wash", "General check-up"]),
+             "schedule": "pending", "next_service_type": "Second free service",
+             "next_service_date": days_ahead(80)}  # ignored: no date until the oil change
+    assert staff.post(f"/api/appointments/{aid}/close", data={**first, "next_service_type": ""}, files=pdf).status_code == 400
+    assert staff.post(f"/api/appointments/{aid}/close", data={**first, "schedule": "maybe"}, files=pdf).status_code == 400
+    assert staff.post(f"/api/appointments/{aid}/close", data=first, files=pdf).status_code == 201
+
+    bike = db.get_customer(karthik["id"])["vehicles"][0]
+    assert (bike["next_due_pending"], bike["next_service_type"], bike["last_service_date"]) == (1, "Second free service", days_ahead(-7))
+    # Not in the call list, however far ahead it looks (its date is only an estimate).
+    assert bike_id not in [d["vehicle_id"] for d in staff.get("/api/due-services?days=400").json()]
+    assert "after its next oil change" in bot.build_system_instruction(db.get_customer(karthik["id"]))
+
+    # A week later: oil changed (walk-in), so now the date is fixed.
+    oil = {"service_date": days_ahead(0), "service_type": "General check-up", "odometer_km": "1150",
+           "jobs_done": json.dumps(["Engine oil change"]), "schedule": "set",
+           "next_service_type": "Second free service", "next_service_date": days_ahead(90)}
+    assert staff.post(f"/api/vehicles/{bike_id}/services", data=oil, files=pdf).status_code == 201
+    bike = db.get_customer(karthik["id"])["vehicles"][0]
+    assert (bike["next_due_pending"], bike["next_service_type"], bike["next_service_date"]) == (0, "Second free service", days_ahead(90))
+    assert "after its next oil change" not in bot.build_system_instruction(db.get_customer(karthik["id"]))
+
+
+def test_accident_repair_after_a_service_leaves_the_schedule_alone(db, monkeypatch):
+    """Case 2: serviced, then a few days later in for an accident repair. The
+    repair is recorded (odometer too) but the service schedule doesn't move;
+    editing the earlier service still updates the bike."""
+    import json
+
+    staff = _api_client(monkeypatch, admin=False)
+    karthik = db.get_customer_by_mobile("9876543210")
+    bike_id = karthik["vehicles"][0]["id"]
+    aid = staff.post("/api/appointments", json={"customer_id": karthik["id"], "appointment_date": days_ahead(1)}).json()["id"]
+    pdf = {"report": ("a.pdf", PDF, "application/pdf")}
+    service = {"service_date": days_ahead(-4), "service_type": "Second free service", "odometer_km": "4000",
+               "jobs_done": json.dumps(["Engine oil change"]),
+               "next_service_type": "Third free service", "next_service_date": days_ahead(86)}
+    sid = staff.post(f"/api/appointments/{aid}/close", data=service, files=pdf).json()["id"]
+    repair = {"service_date": days_ahead(0), "service_type": "Accident repair", "job_type": "Accidental",
+              "odometer_km": "4120", "work_done": "Front fork and headlamp replaced", "schedule": "keep",
+              "next_service_type": "Paid service", "next_service_date": days_ahead(10)}  # ignored for a repair
+    rid = staff.post(f"/api/vehicles/{bike_id}/services", data=repair, files=pdf).json()["id"]
+    bike = db.get_customer(karthik["id"])["vehicles"][0]
+    assert (bike["last_service_date"], bike["next_service_type"], bike["next_service_date"], bike["odometer_km"]) == (
+        days_ahead(-4), "Third free service", days_ahead(86), 4120)
+    history = staff.get(f"/api/vehicles/{bike_id}/service-history").json()
+    assert [(h["id"], h["schedule"]) for h in history[:2]] == [(rid, "keep"), (sid, "set")]
+
+    # The earlier service is still the one that decides the schedule.
+    staff.patch(f"/api/service-records/{sid}", data={**service, "next_service_date": days_ahead(100)}, files=None)
+    bike = db.get_customer(karthik["id"])["vehicles"][0]
+    assert (bike["next_service_date"], bike["odometer_km"]) == (days_ahead(100), 4120)  # odometer: the repair's
+
+    admin = _api_client(monkeypatch, admin=True)
+    assert admin.delete(f"/api/service-records/{rid}").status_code == 200
+    bike = db.get_customer(karthik["id"])["vehicles"][0]
+    assert (bike["next_service_date"], bike["odometer_km"]) == (days_ahead(100), 4000)
