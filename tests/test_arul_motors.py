@@ -1569,3 +1569,34 @@ def test_accident_repair_type_is_recorded_without_any_follow_up(db, monkeypatch)
     oil = {**visit, "service_type": "Paid service", "job_type": "Paid service", "next_service_type": "Accident repair"}
     r = staff.post(f"/api/vehicles/{bike['id']}/services", data=oil, files=pdf)
     assert r.status_code == 400 and "repair" in r.json()["detail"]
+
+
+def test_our_staff_admins_manage_sales_spares_and_mechanics(db, monkeypatch):
+    """Our staff: the showroom's people in three categories. Admins add, edit
+    and remove them; every signed-in user can list them (the job card's
+    mechanic dropdown)."""
+    admin = _api_client(monkeypatch, admin=True)
+    staff = _api_client(monkeypatch, admin=False)
+    r = admin.post("/api/showroom-staff", json={"name": "  Kumar  ", "category": "mechanic", "mobile_number": "+91 98765 11111"})
+    assert r.status_code == 201, r.text
+    kumar = r.json()["id"]
+    assert admin.post("/api/showroom-staff", json={"name": "Ravi", "category": "Sales"}).status_code == 201
+    assert admin.post("/api/showroom-staff", json={"name": "Selvi", "category": "Spares"}).status_code == 201
+    assert admin.post("/api/showroom-staff", json={"name": "kumar", "category": "Mechanic"}).status_code == 400  # duplicate
+    assert admin.post("/api/showroom-staff", json={"name": "Kumar", "category": "Sales"}).status_code == 201  # other category: fine
+    assert admin.post("/api/showroom-staff", json={"name": "X", "category": "Driver"}).status_code == 400
+    assert admin.post("/api/showroom-staff", json={"name": "X", "category": "Sales", "mobile_number": "123"}).status_code == 400
+    assert staff.post("/api/showroom-staff", json={"name": "Y", "category": "Sales"}).status_code == 403  # admins only
+
+    people = staff.get("/api/showroom-staff").json()
+    assert [(p["category"], p["name"]) for p in people] == [
+        ("Sales", "Kumar"), ("Sales", "Ravi"), ("Spares", "Selvi"), ("Mechanic", "Kumar")]
+    mech = next(p for p in people if p["id"] == kumar)
+    assert (mech["mobile_number"], mech["active"]) == ("9876511111", True)
+
+    assert staff.patch(f"/api/showroom-staff/{kumar}", json={"active": False}).status_code == 403
+    assert admin.patch(f"/api/showroom-staff/{kumar}", json={"active": False, "mobile_number": ""}).status_code == 200
+    mech = next(p for p in staff.get("/api/showroom-staff").json() if p["id"] == kumar)
+    assert (mech["active"], mech["mobile_number"]) == (False, None)
+    assert admin.delete(f"/api/showroom-staff/{kumar}").status_code == 200
+    assert admin.delete(f"/api/showroom-staff/{kumar}").status_code == 404

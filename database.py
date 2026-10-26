@@ -373,6 +373,20 @@ def init_db():
     ) {t['table']}
     """)
 
+    # The showroom's people (CRM page "Our staff"): sales, spares and mechanics.
+    # Not CRM logins (those are staff_users). Mechanics fill the job card's
+    # mechanic field.
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS showroom_staff (
+        id {t['pk']},
+        name {t['str']} NOT NULL,
+        category {t['id']} NOT NULL,
+        mobile_number {t['str']},
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) {t['table']}
+    """)
+
     # Service types offered by the workshop, managed from the CRM. Bikes and
     # bookings store the type's name; `interval_days` / `interval_km` say when
     # the next service of this type falls due (empty = on-demand type).
@@ -2353,6 +2367,118 @@ def get_dashboard_stats() -> dict:
 # ---------------------------------------------------------------------------
 # Service types (managed from the CRM)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Our staff (the showroom's people, not CRM logins)
+# ---------------------------------------------------------------------------
+STAFF_CATEGORIES = ("Sales", "Spares", "Mechanic")
+
+
+def list_showroom_staff() -> list:
+    """Everyone, by category (Sales, Spares, Mechanic) then name."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM showroom_staff ORDER BY name")
+    rows = [_plain(r) for r in cursor.fetchall()]
+    conn.close()
+    for row in rows:
+        row["active"] = bool(row["active"])
+    order = {c: i for i, c in enumerate(STAFF_CATEGORIES)}
+    return sorted(rows, key=lambda r: (order.get(r["category"], 99), r["name"].lower()))
+
+
+def _clean_showroom_staff(fields: dict) -> tuple[dict, str | None]:
+    clean = {k: v for k, v in fields.items() if k in ("name", "category", "mobile_number", "active")}
+    if "name" in clean:
+        clean["name"] = re.sub(r"\s+", " ", clean["name"] or "").strip()
+        if not clean["name"]:
+            return clean, "Enter the name."
+        if len(clean["name"]) > 80:
+            return clean, "Keep the name under 80 characters."
+    if "category" in clean:
+        match = next((c for c in STAFF_CATEGORIES if c.lower() == (clean["category"] or "").strip().lower()), None)
+        if not match:
+            return clean, f"Category must be one of: {', '.join(STAFF_CATEGORIES)}."
+        clean["category"] = match
+    if "mobile_number" in clean:
+        digits = _digits(clean["mobile_number"])[-10:] if clean["mobile_number"] else ""
+        if clean["mobile_number"] and len(digits) != 10:
+            return clean, "Enter a 10-digit mobile number, or leave it empty."
+        clean["mobile_number"] = digits or None
+    if "active" in clean:
+        clean["active"] = 1 if clean["active"] else 0
+    return clean, None
+
+
+def _staff_name_taken(cursor, name: str, category: str, other_id: int | None = None) -> bool:
+    cursor.execute(
+        "SELECT id FROM showroom_staff WHERE LOWER(name) = LOWER(?) AND category = ? AND id != ?",
+        (name, category, other_id or 0),
+    )
+    return cursor.fetchone() is not None
+
+
+def create_showroom_staff(**fields) -> tuple[bool, str, int | None]:
+    clean, error = _clean_showroom_staff({"active": True, **fields})
+    if error or "name" not in clean or "category" not in clean:
+        return (False, error or "Enter the name and category.", None)
+    conn = _connect()
+    cursor = conn.cursor()
+    if _staff_name_taken(cursor, clean["name"], clean["category"]):
+        conn.close()
+        return (False, f"{clean['name']} is already in {clean['category']}.", None)
+    cursor.execute(
+        f"INSERT INTO showroom_staff ({', '.join(clean)}) VALUES ({', '.join('?' for _ in clean)})",
+        tuple(clean.values()),
+    )
+    staff_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    _record_change(["showroom_staff"])
+    return (True, f"{clean['name']} added to {clean['category']}.", staff_id)
+
+
+def update_showroom_staff(staff_id: int, **fields) -> tuple[bool, str]:
+    clean, error = _clean_showroom_staff({k: v for k, v in fields.items() if v is not None or k == "mobile_number"})
+    if error:
+        return (False, error)
+    if not clean:
+        return (False, "Nothing to change.")
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM showroom_staff WHERE id = ?", (staff_id,))
+    current = cursor.fetchone()
+    if not current:
+        conn.close()
+        return (False, "Staff member not found.")
+    name, category = clean.get("name", current["name"]), clean.get("category", current["category"])
+    if _staff_name_taken(cursor, name, category, staff_id):
+        conn.close()
+        return (False, f"{name} is already in {category}.")
+    cursor.execute(
+        f"UPDATE showroom_staff SET {', '.join(f'{k} = ?' for k in clean)} WHERE id = ?", (*clean.values(), staff_id)
+    )
+    conn.commit()
+    conn.close()
+    _record_change(["showroom_staff"])
+    return (True, f"{name} updated.")
+
+
+def delete_showroom_staff(staff_id: int) -> tuple[bool, str]:
+    """Remove someone from the list. Job cards keep the names written on them."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM showroom_staff WHERE id = ?", (staff_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return (False, "Staff member not found.")
+    cursor.execute("DELETE FROM showroom_staff WHERE id = ?", (staff_id,))
+    conn.commit()
+    conn.close()
+    _record_change(["showroom_staff"])
+    return (True, f"{row['name']} removed.")
+
+
 SERVICE_TYPE_FIELDS = (
     "name", "description", "is_free", "interval_days", "interval_km", "price", "overdue_days", "active",
     "is_repair",

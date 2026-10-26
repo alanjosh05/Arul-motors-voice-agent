@@ -1071,6 +1071,47 @@ def create_staff(body: StaffIn):
     )
 
 
+# ---------------------------------------------------------------------------
+# Our staff: the showroom's people (sales, spares, mechanics); not logins
+# ---------------------------------------------------------------------------
+class ShowroomStaffIn(BaseModel):
+    name: str
+    category: str  # Sales, Spares or Mechanic
+    mobile_number: str | None = None
+    active: bool = True
+
+
+class ShowroomStaffPatch(BaseModel):
+    name: str | None = None
+    category: str | None = None
+    mobile_number: str | None = None  # "" clears it
+    active: bool | None = None
+
+
+@api.get("/showroom-staff")
+def get_showroom_staff():
+    """Everyone (any signed-in user: the job card's mechanic list uses it)."""
+    return database.list_showroom_staff()
+
+
+@api.post("/showroom-staff", status_code=201, dependencies=[Depends(admin_user)])
+def add_showroom_staff(body: ShowroomStaffIn):
+    ok, message, staff_id = database.create_showroom_staff(**body.model_dump())
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {"message": message, "id": staff_id}
+
+
+@api.patch("/showroom-staff/{staff_id}", dependencies=[Depends(admin_user)])
+def edit_showroom_staff(staff_id: int, body: ShowroomStaffPatch):
+    return _check(database.update_showroom_staff(staff_id, **body.model_dump(exclude_unset=True)))
+
+
+@api.delete("/showroom-staff/{staff_id}", dependencies=[Depends(admin_user)])
+def remove_showroom_staff(staff_id: int):
+    return _check(database.delete_showroom_staff(staff_id))
+
+
 @api.delete("/staff/{user_id}")
 def delete_staff(user_id: int, user: dict = Depends(admin_user)):
     if user_id == user["id"]:
