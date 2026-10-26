@@ -984,8 +984,9 @@ def test_admin_excel_export_and_database_backup(db, monkeypatch, tmp_path):
     assert bikes[0][:3] == ("Customer", "Mobile", "Alternate mobile") and len(bikes) == 5
     karthik = next(row for row in bikes if row[0] == "Karthik Raja")
     assert karthik[1] == "9876543210" and karthik[2] == "9840077777"
-    assert hasattr(karthik[8], "year")  # next service due is a date cell
-    assert karthik[12] == "Call back"
+    assert karthik[5] == "Arul Motors"  # bought from
+    assert hasattr(karthik[9], "year")  # next service due is a date cell
+    assert karthik[13] == "Call back"
     assert len(list(wb["Calls"].iter_rows())) == 2
     assert len(list(wb["Service Types"].iter_rows())) == 1 + len(db.list_service_types())
 
@@ -1395,3 +1396,65 @@ def test_dashboard_lists_upcoming_bookings_and_recent_services(db, monkeypatch):
     assert (top["kind"], top["id"], top["job_card_no"], top["customer_id"]) == ("record", rid, "9001", 1)
     dates = [r["service_date"] for r in stats["recent_services"]]
     assert dates == sorted(dates, reverse=True) and len(dates) <= 8
+
+
+def test_bike_bought_elsewhere_walks_in_for_its_third_free_service(db, monkeypatch):
+    """Most bikes serviced here were bought from another dealer: added without
+    a purchase date, then serviced as a walk-in (no booking) for whichever
+    service it came for. The bike moves on from that service; deleting it
+    puts the bike back."""
+    import json
+
+    import bot
+
+    staff = _api_client(monkeypatch, admin=False)
+    r = staff.post("/api/vehicles", json={
+        "name": "Walk-in Murugan", "mobile_number": "9000011111", "registration_number": "tn 72 x 4321",
+        "model": "Yamaha FZ-S", "next_service_date": days_ahead(0), "next_service_type": "Third free service",
+        "bought_elsewhere": True, "dealer_name": "  Other Yamaha, Tirunelveli ",
+    })
+    assert r.status_code == 201, r.text
+    bike = next(v for v in staff.get("/api/vehicles").json() if v["registration_number"] == "TN 72 X 4321")
+    assert (bike["bought_elsewhere"], bike["dealer_name"], bike["purchase_date"]) == (1, "Other Yamaha, Tirunelveli", None)
+    assert "bought at another dealer" in bot._bought(bike)
+    assert bot._bought({"bought_elsewhere": 0, "purchase_date": None}) == "bought here"
+
+    form = {"service_date": days_ahead(0), "service_type": "Third free service", "job_type": "Free service",
+            "odometer_km": "9100", "jobs_done": json.dumps(["Engine oil change"]), "job_card_no": "7001",
+            "next_service_date": days_ahead(120), "next_service_type": "Paid service"}
+    pdf = {"report": ("7001.pdf", PDF, "application/pdf")}
+    url = f"/api/vehicles/{bike['id']}/services"
+    assert staff.post(url, data={**form, "service_type": ""}, files=pdf).status_code == 400  # which service?
+    assert staff.post("/api/vehicles/99999/services", data=form, files=pdf).status_code == 404
+    done_before = staff.get("/api/stats").json()["totals"]["completed_this_month"]
+    r = staff.post(url, data=form, files=pdf)
+    assert r.status_code == 201, r.text
+    rid = r.json()["id"]
+
+    after = next(v for v in staff.get("/api/vehicles").json() if v["id"] == bike["id"])
+    assert (after["last_service_date"], after["odometer_km"]) == (days_ahead(0), 9100)
+    assert (after["next_service_type"], after["next_service_date"]) == ("Paid service", days_ahead(120))
+    history = staff.get(f"/api/vehicles/{bike['id']}/service-history").json()
+    assert (history[0]["id"], history[0]["service_type"], history[0]["appointment_id"]) == (rid, "Third free service", None)
+    assert staff.get("/api/stats").json()["totals"]["completed_this_month"] == done_before + 1
+
+    # With a booking open, that booking is closed instead (no double record).
+    karthik = db.get_customer_by_mobile("9876543210")
+    staff.post("/api/appointments", json={"customer_id": karthik["id"], "appointment_date": days_ahead(1)})
+    r = staff.post(f"/api/vehicles/{karthik['vehicles'][0]['id']}/services", data=form, files=pdf)
+    assert r.status_code == 400 and "Close that booking" in r.json()["detail"]
+
+    # Deleting the walk-in service puts the bike back (nothing to reopen).
+    admin = _api_client(monkeypatch, admin=True)
+    assert admin.delete(f"/api/service-records/{rid}").status_code == 200
+    back = next(v for v in admin.get("/api/vehicles").json() if v["id"] == bike["id"])
+    assert (back["next_service_type"], back["next_service_date"], back["last_service_date"]) == (
+        "Third free service", days_ahead(0), None)
+
+    # Editing: bought here after all, with a purchase date; then "not known" again.
+    assert admin.patch(f"/api/vehicles/{bike['id']}", json={"bought_elsewhere": False, "purchase_date": "2025-01-10"}).status_code == 200
+    edited = next(v for v in admin.get("/api/vehicles").json() if v["id"] == bike["id"])
+    assert (edited["bought_elsewhere"], edited["dealer_name"], edited["purchase_date"]) == (0, None, "2025-01-10")
+    assert admin.patch(f"/api/vehicles/{bike['id']}", json={"bought_elsewhere": True, "purchase_date": ""}).status_code == 200
+    edited = next(v for v in admin.get("/api/vehicles").json() if v["id"] == bike["id"])
+    assert (edited["bought_elsewhere"], edited["purchase_date"]) == (1, None)

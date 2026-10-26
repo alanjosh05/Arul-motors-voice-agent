@@ -2,7 +2,8 @@
 
 Arul Motors, in **Nazareth, Thoothukudi district, Tamil Nadu**, is a **Yamaha sub-dealer showroom** that sells Yamaha bikes and
 scooters and services them. This **outbound** voice agent follows up with
-customers who bought a bike there. It calls to say the bike's service is coming
+customers whose bikes it services: bikes sold there, and the many bought from
+other dealers that come there for service. It calls to say the bike's service is coming
 up and asks **which date** they will bring it in. There are no time slots.
 
 The agent has **no personal name**. It just says it is calling from *Arul
@@ -170,6 +171,16 @@ booking இருக்கா?". Every filter is optional and they combine:
   due service), all in one transaction. A bike's history:
   `GET /api/vehicles/{id}/service-history` (records, plus older completed
   bookings such as the client import); the PDF: `GET /api/service-records/{id}/report`.
+- **Bikes bought elsewhere and walk-ins:** most bikes serviced here were bought
+  from another dealer. A bike can be marked `bought_elsewhere` (with an optional
+  `dealer_name`); its purchase date can stay unknown, and its first visit can be
+  any service (e.g. the 3rd free service): nothing enforces the order. A
+  service done without a booking is recorded with **Record service (walk-in)**
+  on the bike (`POST /api/vehicles/{id}/services`, same multipart form as
+  closing, `service_type` required): it saves the record and PDF without a
+  booking and moves the bike on if it's now the latest service. If the bike has
+  an open booking, that booking is closed instead. The agent hears "bought at
+  another dealer", so it never says the bike was bought here.
   The older `POST /api/appointments/{id}/complete` (no record) still works for scripts.
 
 ### Rules (`database.py`)
@@ -299,6 +310,7 @@ Scripts may use `X-API-Key: <API_KEY>` instead.
 | `/api/appointments/{id}` | GET · PATCH | One booking · reschedule / change notes |
 | `/api/appointments/{id}/cancel` · `/complete` | POST | Cancel (deletes it) · mark serviced without a record (scripts) |
 | `/api/appointments/{id}/close` | POST | Close service: multipart form with the details and `report` (PDF ≤ 10 MB) |
+| `/api/vehicles/{id}/services` | POST | Record a walk-in service (no booking): same form; `service_type` required |
 | `/api/vehicles/{id}/service-history` | GET | A bike's maintenance records and older services, newest first |
 | `/api/service-records/{id}/report` | GET | The service report PDF (inline) |
 | `/api/appointments/search?…` | GET | Fuzzy booking search (same matching as the voice tool) |

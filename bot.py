@@ -222,13 +222,21 @@ def _today_line() -> str:
     return f"{now.strftime('%a %d %b %Y')} ({now.date().isoformat()}), {now.strftime('%H:%M')} IST. Next days: {days}"
 
 
+def _bought(v: dict) -> str:
+    """Where the bike was bought: many serviced here were bought from another
+    dealer (so the agent never says "you bought it from us")."""
+    if v.get("bought_elsewhere"):
+        return "bought at another dealer" + (f" {_say_date(v['purchase_date'])}" if v.get("purchase_date") else "")
+    return f"bought here {_say_date(v['purchase_date'])}" if v.get("purchase_date") else "bought here"
+
+
 def build_system_instruction(customer: dict) -> str:
     """Fill the system prompt with this call's customer, bikes, bookings, the
     details of the service types involved, and today's dates. Kept short:
     Gemini Live re-reads the whole prompt every turn."""
     vehicles = "\n".join(
         f"- {v['model']} {v['registration_number']}: {v['next_service_type']} due "
-        f"{_say_date(v['next_service_date'])}; bought {_say_date(v['purchase_date'])}, "
+        f"{_say_date(v['next_service_date'])}; {_bought(v)}, "
         f"~{v['odometer_km'] or 0} km, last service {_say_date(v['last_service_date'])}"
         for v in customer["vehicles"]
     )

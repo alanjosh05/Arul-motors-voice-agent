@@ -93,14 +93,16 @@ def build_workbook() -> bytes:
         ]
         for v in c["vehicles"] or [None]:
             bike = (
-                [v["model"], v["registration_number"], _day(v["purchase_date"]), _day(v["last_service_date"]),
+                [v["model"], v["registration_number"],
+                 (v.get("dealer_name") or "Another dealer") if v.get("bought_elsewhere") else "Arul Motors",
+                 _day(v["purchase_date"]), _day(v["last_service_date"]),
                  v["odometer_km"], _day(v["next_service_date"]), v["next_service_type"]]
-                if v else ["", "", None, None, None, None, ""]
+                if v else ["", "", "", None, None, None, None, ""]
             )
             bike_rows.append(shared + bike + tail)
     _sheet(wb, "Customers & Bikes", [
         ("Customer", 24, None), ("Mobile", 13, "@"), ("Alternate mobile", 15, "@"),
-        ("Bike model", 30, None), ("Registration", 15, None), ("Purchase date", 13, DAY),
+        ("Bike model", 30, None), ("Registration", 15, None), ("Bought from", 18, None), ("Purchase date", 13, DAY),
         ("Last service", 13, DAY), ("Odometer (km)", 13, "#,##0"), ("Next service due", 15, DAY),
         ("Next service type", 22, None), ("Next booking", 13, DAY), ("Last call", 16, DAY_TIME),
         ("Last call outcome", 17, None),

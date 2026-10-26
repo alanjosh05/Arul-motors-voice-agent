@@ -8,9 +8,11 @@ agent's (MediAgent) handoff notes; hospital-only content was dropped.
 
 An outbound follow-up voice agent for **Arul Motors**, a Yamaha sub-dealer
 showroom in Nazareth, Thoothukudi district, Tamil Nadu. The showroom sells
-Yamaha bikes and services them. The agent calls customers who bought a bike
-there, says their next service is due, and asks **which date** they will bring
-the bike in (date only, no time slots). That date is stored in SQLite.
+Yamaha bikes and services them, including the many bikes bought from other
+dealers (`bought_elsewhere`; purchase date often unknown; first visit can be any
+service; walk-ins recorded without a booking). The agent calls these
+customers, says their next service is due, and asks **which date** they will
+bring the bike in (date only, no time slots). That date is stored in SQLite.
 
 - Speaks natural Tanglish with everyday interjections. Has no personal name:
   "Nazareth Arul Motors Yamaha showroom-ல இருந்து call பண்றோம்".

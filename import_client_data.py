@@ -94,7 +94,9 @@ def read_bikes(ws, problems: list[str]) -> tuple[list[dict], dict[str, list[str]
             "next_service_date": _day(row[8]),
             "next_service_type": _text(row[9]),
         }
-        missing = [k for k in ("name", "model", "registration", "purchase_date") if not bike[k]]
+        # No purchase date is fine: many bikes serviced here were bought from
+        # another dealer and the date isn't known.
+        missing = [k for k in ("name", "model", "registration") if not bike[k]]
         if len(mobile) != 10:
             missing.append("10-digit mobile")
         if missing:
@@ -115,6 +117,9 @@ def plan_next_service(bike: dict, types: list[dict], problems: list[str]) -> boo
         if bike[key]:
             bike[key] = by_name[bike[key].lower()]["name"]
 
+    if not bike["next_service_date"] and not (bike["last_service_date"] or bike["purchase_date"]):
+        problems.append(f"{where}: skipped, needs a next service date, a last service date or a purchase date.")
+        return False
     if not bike["next_service_date"] or not bike["next_service_type"]:
         # Work it out from the schedule: the type after the last one, due its
         # interval after the last service (or the purchase).
@@ -124,14 +129,14 @@ def plan_next_service(bike: dict, types: list[dict], problems: list[str]) -> boo
             following = scheduled[min(names.index(bike["last_service_type"]) + 1, len(scheduled) - 1)]
         else:
             following = scheduled[0]
-        start = date.fromisoformat(bike["last_service_date"] or bike["purchase_date"])
+        start = date.fromisoformat(bike["last_service_date"] or bike["purchase_date"] or bike["next_service_date"])
         bike["next_service_type"] = bike["next_service_type"] or following["name"]
         due = start + timedelta(days=following["interval_days"])
         bike["next_service_date"] = bike["next_service_date"] or due.isoformat()
         problems.append(f"{where}: next service worked out as {bike['next_service_type']} on {bike['next_service_date']}.")
 
     last = bike["last_service_date"] or bike["purchase_date"]
-    if bike["next_service_date"] <= last:
+    if last and bike["next_service_date"] <= last:
         # e.g. 17-01-2026 typed for 17-01-2027: move it to the next year after the last service.
         fixed = date.fromisoformat(bike["next_service_date"])
         while fixed.isoformat() <= last:

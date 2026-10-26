@@ -472,6 +472,8 @@ class VehicleIn(BaseModel):
     odometer_km: int | None = None
     last_service_date: str | None = None
     alternate_mobile: str | None = None  # used only when this creates the customer
+    bought_elsewhere: bool = False  # bought from another dealer, serviced here
+    dealer_name: str | None = None
 
 
 class VehiclePatch(BaseModel):
@@ -484,6 +486,8 @@ class VehiclePatch(BaseModel):
     next_service_type: str | None = None
     frame_number: str | None = None
     engine_number: str | None = None
+    bought_elsewhere: bool | None = None
+    dealer_name: str | None = None  # "" clears it (as does "" for purchase_date)
 
 
 @api.get("/vehicles")
@@ -748,6 +752,25 @@ def close_service(
     )
     if not ok:
         raise HTTPException(status_code=404 if message.startswith("No open booking") else 400, detail=message)
+    return {"message": message, "id": record_id}
+
+
+@api.post("/vehicles/{vehicle_id}/services", status_code=201)
+def record_walk_in_service(
+    vehicle_id: int,
+    details: dict = Depends(job_card_form),
+    report: UploadFile = File(..., description="Scanned job card / service report (PDF)"),
+    user: dict = Depends(current_user),
+):
+    """Workshop: record a service done without a booking (a walk-in, e.g. a
+    bike bought elsewhere in for its 3rd free service), with its job card.
+    Same multipart fields as closing a booking; `service_type` is required."""
+    pdf = report.file.read(database.MAX_PDF_BYTES + 1)
+    ok, message, record_id = database.record_walk_in_service(
+        vehicle_id, details, pdf, report.filename, actor=user.get("full_name") or user["username"]
+    )
+    if not ok:
+        raise HTTPException(status_code=404 if message == "Bike not found." else 400, detail=message)
     return {"message": message, "id": record_id}
 
 

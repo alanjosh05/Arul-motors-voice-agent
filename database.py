@@ -457,6 +457,10 @@ def init_db():
     # Bikes: frame (chassis) and engine numbers, filled from the job card.
     _ensure_column(cursor, "vehicles", "frame_number", t["str"])
     _ensure_column(cursor, "vehicles", "engine_number", t["str"])
+    # Many bikes serviced here were bought from another dealer: the purchase
+    # date is then often unknown, and the first visit can be any service.
+    _ensure_column(cursor, "vehicles", "bought_elsewhere", "INTEGER DEFAULT 0")
+    _ensure_column(cursor, "vehicles", "dealer_name", t["str"])
 
     # The service report PDF for each record, as a BLOB. A separate table so
     # lists and history never read the file; only "View PDF" does.
@@ -757,9 +761,12 @@ def add_customer_vehicle(
     odometer_km: int | None = None,
     last_service_date: str | None = None,
     alternate_mobile: str | None = None,
+    bought_elsewhere: bool = False,
+    dealer_name: str | None = None,
 ) -> tuple[bool, str]:
-    """Add a bike sale (creating the customer, with `alternate_mobile`, if the
-    mobile number is new)."""
+    """Add a bike (creating the customer, with `alternate_mobile`, if the
+    mobile number is new): one sold here, or one `bought_elsewhere` (from
+    `dealer_name`, purchase date often unknown) that comes here for service."""
     name = (name or "").strip()
     mobile_number = (mobile_number or "").strip()
     registration_number = (registration_number or "").strip().upper()
@@ -790,8 +797,9 @@ def add_customer_vehicle(
 
     cursor.execute(
         """
-    INSERT INTO vehicles (customer_id, registration_number, model, purchase_date, last_service_date, odometer_km, next_service_date, next_service_type)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO vehicles (customer_id, registration_number, model, purchase_date, last_service_date, odometer_km,
+                          next_service_date, next_service_type, bought_elsewhere, dealer_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
         (
             customer_id,
@@ -802,6 +810,8 @@ def add_customer_vehicle(
             odometer_km,
             due,
             next_service_type,
+            1 if bought_elsewhere else 0,
+            (dealer_name or "").strip() or None if bought_elsewhere else None,
         ),
     )
     conn.commit()
@@ -1333,6 +1343,69 @@ def close_service(appointment_id: str, details: dict, pdf: bytes | None, pdf_nam
     conn.close()
     _record_change(BOOKING_ENTITIES + ["vehicles", "service_records"], booking["customer_id"])
     return (True, f"Service closed for booking {booking['id']}.", record_id)
+
+
+def record_walk_in_service(vehicle_id: int, details: dict, pdf: bytes | None, pdf_name: str | None,
+                           actor: str | None = None) -> tuple[bool, str, int | None]:
+    """Record a service done without a booking (a walk-in): the bike, often
+    bought from another dealer, came in for whichever service it was due (say
+    its 3rd free service), and the job card is recorded as that service. Same
+    fields and rules as closing a booking. If this is now the bike's latest
+    service, the bike moves on (last service, odometer, next due service).
+    Returns (ok, message, record_id)."""
+    try:
+        rec = _clean_job_card(details)
+        _check_pdf(pdf)
+    except ValueError as e:
+        return (False, str(e), None)
+    if not rec["service_type"]:
+        return (False, "Pick the service that was done (e.g. Third free service).", None)
+
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, customer_id, registration_number FROM vehicles WHERE id = ?", (vehicle_id,))
+    vehicle = cursor.fetchone()
+    if not vehicle:
+        conn.close()
+        return (False, "Bike not found.", None)
+    cursor.execute(
+        "SELECT id FROM service_appointments WHERE vehicle_id = ? AND status = 'CONFIRMED' ORDER BY appointment_date LIMIT 1",
+        (vehicle_id,),
+    )
+    booking = cursor.fetchone()
+    if booking:
+        conn.close()
+        return (False, f"This bike has booking {booking['id']}. Close that booking with the job card instead.", None)
+    cursor.execute(f"SELECT {', '.join(BIKE_STATE)} FROM vehicles WHERE id = ?", (vehicle_id,))
+    bike = cursor.fetchone()
+    bike_before = json.dumps({column: bike[column] for column in BIKE_STATE})
+    columns = ["vehicle_id", "customer_id", *rec, "created_by", "bike_before"]
+    values = [vehicle_id, vehicle["customer_id"], *rec.values(), actor, bike_before]
+    try:
+        cursor.execute(
+            f"INSERT INTO service_records ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+            values,
+        )
+        record_id = cursor.lastrowid
+        cursor.execute(
+            "INSERT INTO service_documents (record_id, filename, content_type, size_bytes, data) VALUES (?, ?, ?, ?, ?)",
+            (record_id, _pdf_filename(pdf_name), "application/pdf", len(pdf), pdf),
+        )
+        # An older service typed in afterwards doesn't move the bike back.
+        cursor.execute(
+            "SELECT id FROM service_records WHERE vehicle_id = ? ORDER BY service_date DESC, id DESC LIMIT 1",
+            (vehicle_id,),
+        )
+        if cursor.fetchone()["id"] == record_id:
+            _move_bike_on(cursor, vehicle_id, rec)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+    _record_change(["vehicles", "service_records", "customers", "due", "stats"], vehicle["customer_id"])
+    return (True, f"{rec['service_type']} recorded for {vehicle['registration_number']}.", record_id)
 
 
 def update_service_record(record_id: int, details: dict, pdf: bytes | None = None, pdf_name: str | None = None,
@@ -1938,15 +2011,27 @@ def list_vehicles() -> list:
 VEHICLE_FIELDS = (
     "registration_number", "model", "purchase_date", "last_service_date",
     "odometer_km", "next_service_date", "next_service_type", "frame_number", "engine_number",
+    "bought_elsewhere", "dealer_name",
 )
+# Sent as "" to clear them (e.g. purchase date not known).
+CLEARABLE_VEHICLE_FIELDS = ("purchase_date", "dealer_name")
 
 
 def update_vehicle(vehicle_id: int, **changes) -> tuple[bool, str]:
     changes = {k: v for k, v in changes.items() if k in VEHICLE_FIELDS and v is not None}
+    for key in CLEARABLE_VEHICLE_FIELDS:
+        if key in changes and not str(changes[key]).strip():
+            changes[key] = None
+    if "bought_elsewhere" in changes:
+        changes["bought_elsewhere"] = 1 if changes["bought_elsewhere"] else 0
+        if not changes["bought_elsewhere"]:
+            changes["dealer_name"] = None
+    if "dealer_name" in changes and changes["dealer_name"]:
+        changes["dealer_name"] = changes["dealer_name"].strip()
     if not changes:
         return (False, "Nothing to change.")
     for key in ("purchase_date", "last_service_date", "next_service_date"):
-        if key in changes:
+        if key in changes and changes[key] is not None:
             day = normalize_date(str(changes[key]))
             if not day:
                 return (False, f"Invalid date for {key.replace('_', ' ')}.")
@@ -2058,6 +2143,12 @@ def get_dashboard_stats() -> dict:
         (month_start,),
     )
     completed_this_month = cursor.fetchone()["n"]
+    # Walk-in services (recorded without a booking) count too.
+    cursor.execute(
+        "SELECT count(*) AS n FROM service_records WHERE appointment_id IS NULL AND service_date >= ?",
+        (month_start,),
+    )
+    completed_this_month += cursor.fetchone()["n"]
     cursor.execute(
         """
     SELECT a.*, c.name AS customer_name, c.mobile_number, v.registration_number, v.model
