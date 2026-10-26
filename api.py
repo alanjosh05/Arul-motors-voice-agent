@@ -1076,7 +1076,7 @@ def create_staff(body: StaffIn):
 # ---------------------------------------------------------------------------
 class ShowroomStaffIn(BaseModel):
     name: str
-    category: str  # Sales, Spares or Mechanic
+    category: str  # one of the staff categories (Sales, Spares, Mechanic, or one an admin added)
     mobile_number: str | None = None
     active: bool = True
 
@@ -1086,6 +1086,40 @@ class ShowroomStaffPatch(BaseModel):
     category: str | None = None
     mobile_number: str | None = None  # "" clears it
     active: bool | None = None
+
+
+class StaffCategoryIn(BaseModel):
+    name: str
+    is_mechanic: bool = False  # its people are the job card's mechanic list
+
+
+class StaffCategoryPatch(BaseModel):
+    name: str | None = None
+    is_mechanic: bool | None = None
+
+
+@api.get("/staff-categories")
+def get_staff_categories():
+    """Our staff's categories (any signed-in user)."""
+    return database.list_staff_categories()
+
+
+@api.post("/staff-categories", status_code=201, dependencies=[Depends(admin_user)])
+def add_staff_category(body: StaffCategoryIn):
+    ok, message, category_id = database.create_staff_category(**body.model_dump())
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {"message": message, "id": category_id}
+
+
+@api.patch("/staff-categories/{category_id}", dependencies=[Depends(admin_user)])
+def edit_staff_category(category_id: int, body: StaffCategoryPatch):
+    return _check(database.update_staff_category(category_id, **body.model_dump(exclude_unset=True)))
+
+
+@api.delete("/staff-categories/{category_id}", dependencies=[Depends(admin_user)])
+def remove_staff_category(category_id: int):
+    return _check(database.delete_staff_category(category_id))
 
 
 @api.get("/showroom-staff")

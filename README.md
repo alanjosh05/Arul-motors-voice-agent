@@ -328,8 +328,10 @@ Scripts may use `X-API-Key: <API_KEY>` instead.
 | `/api/appointments/{id}/cancel` · `/complete` | POST | Cancel (deletes it) · mark serviced without a record (scripts) |
 | `/api/appointments/{id}/close` | POST | Close service: multipart form with the details and `report` (PDF ≤ 10 MB) |
 | `/api/vehicles/{id}/services` | POST | Record a walk-in service (no booking): same form; `service_type` required |
-| `/api/showroom-staff` | GET · POST | Our staff: the showroom's people (Sales / Spares / Mechanic; not logins). List: any user (job card mechanic list); add: admins |
+| `/api/showroom-staff` | GET · POST | Our staff: the showroom's people (by category; not logins). List: any user (job card mechanic list); add: admins |
 | `/api/showroom-staff/{id}` | PATCH · DELETE | Edit (name, category, mobile, `active` = working here) or remove: admins |
+| `/api/staff-categories` | GET · POST | Our staff's categories (Sales / Spares / Mechanic to start); add: admins. `is_mechanic`: its people are the job card's mechanic list |
+| `/api/staff-categories/{id}` | PATCH · DELETE | Rename (staff move with it) / switch `is_mechanic`, or delete an empty category: admins |
 | `/api/vehicles/{id}/service-history` | GET | A bike's maintenance records and older services, newest first |
 | `/api/service-records/{id}/report` | GET | The service report PDF (inline) |
 | `/api/appointments/search?…` | GET | Fuzzy booking search (same matching as the voice tool) |

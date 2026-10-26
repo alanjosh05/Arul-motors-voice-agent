@@ -1600,3 +1600,39 @@ def test_our_staff_admins_manage_sales_spares_and_mechanics(db, monkeypatch):
     assert (mech["active"], mech["mobile_number"]) == (False, None)
     assert admin.delete(f"/api/showroom-staff/{kumar}").status_code == 200
     assert admin.delete(f"/api/showroom-staff/{kumar}").status_code == 404
+
+
+def test_admins_manage_our_staff_categories(db, monkeypatch):
+    """Sales, Spares and Mechanic to start; admins add, rename (staff move
+    with it) and delete empty categories; one category's people can be the
+    job card's mechanics."""
+    admin = _api_client(monkeypatch, admin=True)
+    staff = _api_client(monkeypatch, admin=False)
+    cats = staff.get("/api/staff-categories").json()
+    assert [(c["name"], c["is_mechanic"]) for c in cats] == [("Sales", False), ("Spares", False), ("Mechanic", True)]
+
+    assert admin.post("/api/showroom-staff", json={"name": "Anand", "category": "Driver"}).status_code == 400  # no such category
+    assert staff.post("/api/staff-categories", json={"name": "Driver"}).status_code == 403  # admins only
+    r = admin.post("/api/staff-categories", json={"name": "  Driver "})
+    assert r.status_code == 201, r.text
+    driver = r.json()["id"]
+    assert admin.post("/api/staff-categories", json={"name": "driver"}).status_code == 400  # duplicate
+    assert admin.post("/api/showroom-staff", json={"name": "Anand", "category": "driver"}).status_code == 201
+
+    # Rename: the people move with it.
+    assert admin.patch(f"/api/staff-categories/{driver}", json={"name": "Delivery driver"}).status_code == 200
+    anand = next(p for p in staff.get("/api/showroom-staff").json() if p["name"] == "Anand")
+    assert anand["category"] == "Delivery driver"
+    assert next(c for c in staff.get("/api/staff-categories").json() if c["id"] == driver)["staff_count"] == 1
+
+    # Not deleted while it has people.
+    r = admin.delete(f"/api/staff-categories/{driver}")
+    assert r.status_code == 400 and "still has 1" in r.json()["detail"]
+    admin.delete(f"/api/showroom-staff/{anand['id']}")
+    assert admin.delete(f"/api/staff-categories/{driver}").status_code == 200
+    assert admin.delete(f"/api/staff-categories/{driver}").status_code == 404
+
+    # Which category is the job card's mechanics can change.
+    mech = next(c for c in cats if c["name"] == "Mechanic")
+    assert admin.patch(f"/api/staff-categories/{mech['id']}", json={"name": "Technician", "is_mechanic": True}).status_code == 200
+    assert next(c for c in staff.get("/api/staff-categories").json() if c["id"] == mech["id"])["name"] == "Technician"

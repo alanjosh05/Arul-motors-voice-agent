@@ -387,6 +387,25 @@ def init_db():
     ) {t['table']}
     """)
 
+    # Our staff's categories, managed by admins. Staff store the category's
+    # name (renames cascade). `is_mechanic`: its people are the job card's
+    # mechanic list. Seeded once with Sales, Spares and Mechanic.
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS staff_categories (
+        id {t['pk']},
+        name {t['str']} NOT NULL UNIQUE,
+        is_mechanic INTEGER NOT NULL DEFAULT 0,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) {t['table']}
+    """)
+    cursor.execute("SELECT count(*) AS n FROM staff_categories")
+    if cursor.fetchone()["n"] == 0:
+        for order, (name, is_mechanic) in enumerate(DEFAULT_STAFF_CATEGORIES, start=1):
+            cursor.execute(
+                "INSERT INTO staff_categories (name, is_mechanic, sort_order) VALUES (?, ?, ?)", (name, is_mechanic, order)
+            )
+
     # Service types offered by the workshop, managed from the CRM. Bikes and
     # bookings store the type's name; `interval_days` / `interval_km` say when
     # the next service of this type falls due (empty = on-demand type).
@@ -2370,20 +2389,25 @@ def get_dashboard_stats() -> dict:
 # ---------------------------------------------------------------------------
 # Our staff (the showroom's people, not CRM logins)
 # ---------------------------------------------------------------------------
-STAFF_CATEGORIES = ("Sales", "Spares", "Mechanic")
-
-
 def list_showroom_staff() -> list:
-    """Everyone, by category (Sales, Spares, Mechanic) then name."""
+    """Everyone, by category (in the categories' order) then name."""
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM showroom_staff ORDER BY name")
     rows = [_plain(r) for r in cursor.fetchall()]
+    cursor.execute("SELECT name FROM staff_categories ORDER BY sort_order, id")
+    order = {r["name"]: i for i, r in enumerate(cursor.fetchall())}
     conn.close()
     for row in rows:
         row["active"] = bool(row["active"])
-    order = {c: i for i, c in enumerate(STAFF_CATEGORIES)}
-    return sorted(rows, key=lambda r: (order.get(r["category"], 99), r["name"].lower()))
+    return sorted(rows, key=lambda r: (order.get(r["category"], 999), r["name"].lower()))
+
+
+def _staff_category(cursor, name: str | None) -> str | None:
+    """The category's saved name (any case), or None if there's no such category."""
+    cursor.execute("SELECT name FROM staff_categories WHERE LOWER(name) = LOWER(?)", ((name or "").strip(),))
+    row = cursor.fetchone()
+    return row["name"] if row else None
 
 
 def _clean_showroom_staff(fields: dict) -> tuple[dict, str | None]:
@@ -2394,11 +2418,6 @@ def _clean_showroom_staff(fields: dict) -> tuple[dict, str | None]:
             return clean, "Enter the name."
         if len(clean["name"]) > 80:
             return clean, "Keep the name under 80 characters."
-    if "category" in clean:
-        match = next((c for c in STAFF_CATEGORIES if c.lower() == (clean["category"] or "").strip().lower()), None)
-        if not match:
-            return clean, f"Category must be one of: {', '.join(STAFF_CATEGORIES)}."
-        clean["category"] = match
     if "mobile_number" in clean:
         digits = _digits(clean["mobile_number"])[-10:] if clean["mobile_number"] else ""
         if clean["mobile_number"] and len(digits) != 10:
@@ -2423,6 +2442,10 @@ def create_showroom_staff(**fields) -> tuple[bool, str, int | None]:
         return (False, error or "Enter the name and category.", None)
     conn = _connect()
     cursor = conn.cursor()
+    clean["category"] = _staff_category(cursor, clean["category"])
+    if not clean["category"]:
+        conn.close()
+        return (False, f"No category called {fields.get('category')}. An admin can add it.", None)
     if _staff_name_taken(cursor, clean["name"], clean["category"]):
         conn.close()
         return (False, f"{clean['name']} is already in {clean['category']}.", None)
@@ -2450,6 +2473,11 @@ def update_showroom_staff(staff_id: int, **fields) -> tuple[bool, str]:
     if not current:
         conn.close()
         return (False, "Staff member not found.")
+    if "category" in clean:
+        clean["category"] = _staff_category(cursor, clean["category"])
+        if not clean["category"]:
+            conn.close()
+            return (False, f"No category called {fields.get('category')}. An admin can add it.")
     name, category = clean.get("name", current["name"]), clean.get("category", current["category"])
     if _staff_name_taken(cursor, name, category, staff_id):
         conn.close()
@@ -2477,6 +2505,112 @@ def delete_showroom_staff(staff_id: int) -> tuple[bool, str]:
     conn.close()
     _record_change(["showroom_staff"])
     return (True, f"{row['name']} removed.")
+
+
+DEFAULT_STAFF_CATEGORIES = [("Sales", 0), ("Spares", 0), ("Mechanic", 1)]
+
+
+def list_staff_categories() -> list:
+    """Our staff's categories in order, each with how many people are in it."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM staff_categories ORDER BY sort_order, id")
+    rows = [_plain(r) for r in cursor.fetchall()]
+    cursor.execute("SELECT category, count(*) AS n FROM showroom_staff GROUP BY category")
+    counts = {r["category"]: r["n"] for r in cursor.fetchall()}
+    conn.close()
+    for row in rows:
+        row["is_mechanic"] = bool(row["is_mechanic"])
+        row["staff_count"] = counts.get(row["name"], 0)
+    return rows
+
+
+def _clean_category_name(name: str | None) -> tuple[str, str | None]:
+    name = re.sub(r"\s+", " ", name or "").strip()
+    if not name:
+        return name, "Enter the category's name."
+    if len(name) > 40:
+        return name, "Keep the name under 40 characters."
+    return name, None
+
+
+def create_staff_category(name: str, is_mechanic: bool = False) -> tuple[bool, str, int | None]:
+    name, error = _clean_category_name(name)
+    if error:
+        return (False, error, None)
+    conn = _connect()
+    cursor = conn.cursor()
+    if _staff_category(cursor, name):
+        conn.close()
+        return (False, f"There's already a category called {name}.", None)
+    cursor.execute("SELECT max(sort_order) AS n FROM staff_categories")
+    order = (cursor.fetchone()["n"] or 0) + 1
+    cursor.execute(
+        "INSERT INTO staff_categories (name, is_mechanic, sort_order) VALUES (?, ?, ?)",
+        (name, 1 if is_mechanic else 0, order),
+    )
+    category_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    _record_change(["staff_categories", "showroom_staff"])
+    return (True, f"Category {name} added.", category_id)
+
+
+def update_staff_category(category_id: int, name: str | None = None, is_mechanic: bool | None = None) -> tuple[bool, str]:
+    """Rename (its staff move with it) or switch whether it's the job card's mechanics."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM staff_categories WHERE id = ?", (category_id,))
+    current = cursor.fetchone()
+    if not current:
+        conn.close()
+        return (False, "Category not found.")
+    changes = {}
+    if name is not None:
+        name, error = _clean_category_name(name)
+        if error:
+            conn.close()
+            return (False, error)
+        cursor.execute("SELECT id FROM staff_categories WHERE LOWER(name) = LOWER(?) AND id != ?", (name, category_id))
+        if cursor.fetchone():
+            conn.close()
+            return (False, f"There's already a category called {name}.")
+        changes["name"] = name
+    if is_mechanic is not None:
+        changes["is_mechanic"] = 1 if is_mechanic else 0
+    if not changes:
+        conn.close()
+        return (False, "Nothing to change.")
+    cursor.execute(
+        f"UPDATE staff_categories SET {', '.join(f'{k} = ?' for k in changes)} WHERE id = ?", (*changes.values(), category_id)
+    )
+    if "name" in changes and changes["name"] != current["name"]:
+        cursor.execute("UPDATE showroom_staff SET category = ? WHERE category = ?", (changes["name"], current["name"]))
+    conn.commit()
+    conn.close()
+    _record_change(["staff_categories", "showroom_staff"])
+    return (True, f"Category {changes.get('name', current['name'])} updated.")
+
+
+def delete_staff_category(category_id: int) -> tuple[bool, str]:
+    """Delete an empty category (move or remove its people first)."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM staff_categories WHERE id = ?", (category_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return (False, "Category not found.")
+    cursor.execute("SELECT count(*) AS n FROM showroom_staff WHERE category = ?", (row["name"],))
+    people = cursor.fetchone()["n"]
+    if people:
+        conn.close()
+        return (False, f"{row['name']} still has {people} staff. Move them to another category (or remove them) first.")
+    cursor.execute("DELETE FROM staff_categories WHERE id = ?", (category_id,))
+    conn.commit()
+    conn.close()
+    _record_change(["staff_categories", "showroom_staff"])
+    return (True, f"Category {row['name']} deleted.")
 
 
 SERVICE_TYPE_FIELDS = (
