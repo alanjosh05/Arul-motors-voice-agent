@@ -714,9 +714,11 @@ def test_service_types_crud_rename_and_delete_rules(db, monkeypatch):
     assert client.post("/api/service-types", json={"name": "Bad", "interval_days": 0}).status_code == 400
 
     # Reorder, deactivate, clear the price.
+    before = [t["name"] for t in client.get("/api/service-types").json()]
+    above = before[before.index("Engine oil change") - 1]
     assert client.post(f"/api/service-types/{tid}/move", params={"direction": "up"}).status_code == 200
     order = [t["name"] for t in client.get("/api/service-types").json()]
-    assert order.index("Engine oil change") == order.index("General check-up") - 1
+    assert order.index("Engine oil change") == order.index(above) - 1
     assert client.patch(f"/api/service-types/{tid}", json={"active": False, "price": None}).status_code == 200
     assert "Engine oil change" not in [t["name"] for t in client.get("/api/service-types", params={"active_only": True}).json()]
 
@@ -1256,6 +1258,9 @@ def test_out_of_shift_hours_only_admins(db, monkeypatch):
     import auth
 
     tz = db.SHOWROOM_TZ
+    # Sign in before shift hours are switched on (so this passes at any time of day).
+    admin = _api_client(monkeypatch)
+    staff = _api_client(monkeypatch, admin=False)
     monkeypatch.setattr(db, "SHIFT_START", "07:00")
     monkeypatch.setattr(db, "SHIFT_END", "21:00")
     assert db.shift_info(datetime(2026, 10, 25, 6, 59, tzinfo=tz))["open"] is False
@@ -1263,8 +1268,6 @@ def test_out_of_shift_hours_only_admins(db, monkeypatch):
         "open": True, "start": "07:00", "end": "21:00", "changes_at": "2026-10-25T21:00+05:30"}
     assert db.shift_info(datetime(2026, 10, 25, 21, 0, tzinfo=tz))["changes_at"] == "2026-10-26T07:00+05:30"
 
-    admin = _api_client(monkeypatch)
-    staff = _api_client(monkeypatch, admin=False)
     monkeypatch.setattr(db, "shift_info", lambda at=None: {"open": False, "start": "07:00", "end": "21:00", "changes_at": "x"})
     r = staff.get("/api/customers")
     assert r.status_code == 403 and r.json()["detail"].startswith("Out of shift hours")
@@ -1531,3 +1534,38 @@ def test_accident_repair_after_a_service_leaves_the_schedule_alone(db, monkeypat
     assert admin.delete(f"/api/service-records/{rid}").status_code == 200
     bike = db.get_customer(karthik["id"])["vehicles"][0]
     assert (bike["next_service_date"], bike["odometer_km"]) == (days_ahead(100), 4000)
+
+
+
+def test_accident_repair_type_is_recorded_without_any_follow_up(db, monkeypatch):
+    """Accident repair is a service type of its own (seeded once, editable):
+    a visit under it is recorded with its job card but never changes the
+    bike's schedule, so it never leads to a follow-up; it can't be a bike's
+    next service either."""
+    import json
+
+    staff = _api_client(monkeypatch, admin=False)
+    types = {t["name"]: t for t in staff.get("/api/service-types").json()}
+    assert types["Accident repair"]["is_repair"] is True and types["Accident repair"]["interval_days"] is None
+    assert types["Paid service"]["is_repair"] is False
+    karthik = db.get_customer_by_mobile("9876543210")
+    bike = karthik["vehicles"][0]
+    pdf = {"report": ("a.pdf", PDF, "application/pdf")}
+    visit = {"service_date": days_ahead(0), "service_type": "Accident repair", "job_type": "Accidental",
+             "odometer_km": "6100", "work_done": "Fairing and indicator replaced",
+             "schedule": "set", "next_service_type": "Paid service", "next_service_date": days_ahead(5)}
+    r = staff.post(f"/api/vehicles/{bike['id']}/services", data=visit, files=pdf)  # "set" is overridden
+    assert r.status_code == 201, r.text
+    after = db.get_customer(karthik["id"])["vehicles"][0]
+    assert (after["next_service_type"], after["next_service_date"], after["last_service_date"], after["odometer_km"]) == (
+        bike["next_service_type"], bike["next_service_date"], bike["last_service_date"], 6100)
+    assert staff.get(f"/api/vehicles/{bike['id']}/service-history").json()[0]["schedule"] == "keep"
+    # Booked as an accident repair and closed: same, no follow-up.
+    aid = staff.post("/api/appointments", json={"customer_id": karthik["id"], "appointment_date": days_ahead(1),
+                                                "service_type": "Accident repair"}).json()["id"]
+    assert staff.post(f"/api/appointments/{aid}/close", data=visit, files=pdf).status_code == 201
+    assert db.get_customer(karthik["id"])["vehicles"][0]["next_service_date"] == bike["next_service_date"]
+    # A repair can't be the next service.
+    oil = {**visit, "service_type": "Paid service", "job_type": "Paid service", "next_service_type": "Accident repair"}
+    r = staff.post(f"/api/vehicles/{bike['id']}/services", data=oil, files=pdf)
+    assert r.status_code == 400 and "repair" in r.json()["detail"]

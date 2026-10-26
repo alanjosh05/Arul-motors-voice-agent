@@ -190,6 +190,14 @@ booking இருக்கா?". Every filter is optional and they combine:
   which updates the odometer and frame/engine numbers but not the schedule.
   The latest record that counts as a service decides the schedule; deleting a
   record undoes only what it changed.
+- **Repair service types** (`service_types.is_repair`, seeded once with
+  **Accident repair**; any type can be marked "Repair (no follow-up)" in the
+  Service types page): a visit under a repair type, booked or walk-in, is
+  recorded with its job card but always keeps the schedule (`schedule = keep`),
+  so it never leads to a follow-up; a repair type can't be a bike's next service.
+- **Oil change and the form:** with "Engine oil change" ticked the next date is
+  set; unticked, the next service waits for the oil change. Ticking/unticking it
+  (also when editing a saved job card) switches the form's Next service choice.
   The older `POST /api/appointments/{id}/complete` (no record) still works for scripts.
 
 ### Rules (`database.py`)

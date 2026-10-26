@@ -526,6 +526,7 @@ class ServiceTypeIn(BaseModel):
     price: int | None = None
     overdue_days: int | None = None  # days after the due date before it's overdue
     active: bool = True
+    is_repair: bool = False  # e.g. Accident repair: recorded, never followed up
 
 
 class ServiceTypePatch(BaseModel):
@@ -537,6 +538,7 @@ class ServiceTypePatch(BaseModel):
     price: int | None = None
     overdue_days: int | None = None
     active: bool | None = None
+    is_repair: bool | None = None
 
 
 @api.get("/service-types")

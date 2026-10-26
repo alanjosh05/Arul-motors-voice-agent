@@ -60,6 +60,7 @@ DEFAULT_SERVICE_TYPES = [
     ("Paid service", "Regular paid service after the free services.", 0, 120, 4000),
     ("General check-up", "Inspection for a problem the customer reports.", 0, None, None),
 ]
+DEFAULT_REPAIR_TYPE = ("Accident repair", "Repair after an accident. Recorded with its job card; no follow-up.")
 
 # Outcomes the agent may record for a follow-up call.
 CALL_OUTCOMES = {
@@ -244,8 +245,9 @@ def _ensure_index(cursor, name: str, table: str, columns: str) -> None:
         cursor.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})")
 
 
-def _ensure_column(cursor, table: str, column: str, column_type: str) -> None:
-    """Add a column to a table created by an older version (SQLite and MySQL)."""
+def _ensure_column(cursor, table: str, column: str, column_type: str) -> bool:
+    """Add a column to a table created by an older version (SQLite and MySQL).
+    Returns True if it was added just now."""
     if using_mysql():
         cursor.execute(
             "SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() "
@@ -258,6 +260,7 @@ def _ensure_column(cursor, table: str, column: str, column_type: str) -> None:
         exists = any(row["name"] == column for row in cursor.fetchall())
     if not exists:
         cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+    return not exists
 
 
 # Indexes for the lookups the CRM, the agent and the live feed make.
@@ -390,6 +393,9 @@ def init_db():
     """)
     # Days after the due date before this type counts as overdue (empty = 0).
     _ensure_column(cursor, "service_types", "overdue_days", "INTEGER")
+    # Repair types (e.g. Accident repair): recorded like a service, but they
+    # never change the bike's schedule, so they never lead to a follow-up.
+    repairs_new = _ensure_column(cursor, "service_types", "is_repair", "INTEGER DEFAULT 0")
     cursor.execute("SELECT count(*) AS n FROM service_types")
     if cursor.fetchone()["n"] == 0:
         for order, (name, description, is_free, days, km) in enumerate(DEFAULT_SERVICE_TYPES, start=1):
@@ -397,6 +403,24 @@ def init_db():
                 "INSERT INTO service_types (name, description, is_free, interval_days, interval_km, sort_order) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (name, description, is_free, days, km, order),
+            )
+        repairs_new = True
+    if repairs_new:
+        # Once (new database, or the first start with repair types): add
+        # Accident repair; afterwards the showroom manages it like any type.
+        name, description = DEFAULT_REPAIR_TYPE
+        cursor.execute("SELECT id FROM service_types WHERE LOWER(name) = LOWER(?)", (name,))
+        row = cursor.fetchone()
+        if row:
+            cursor.execute(
+                "UPDATE service_types SET is_repair = 1, interval_days = NULL, interval_km = NULL WHERE id = ?",
+                (row["id"],),
+            )
+        else:
+            cursor.execute("SELECT max(sort_order) AS n FROM service_types")
+            cursor.execute(
+                "INSERT INTO service_types (name, description, is_free, is_repair, sort_order) VALUES (?, ?, 0, 1, ?)",
+                (name, description, (cursor.fetchone()["n"] or 0) + 1),
             )
 
     # Change feed for the CRM's live updates. Both the voice agent and the API
@@ -1301,6 +1325,21 @@ BIKE_STATE = ("last_service_date", "next_service_date", "next_service_type", "od
 READING_STATE = ("odometer_km", "frame_number", "engine_number")
 
 
+def _repair_types(cursor) -> set[str]:
+    cursor.execute("SELECT name FROM service_types WHERE COALESCE(is_repair, 0) = 1")
+    return {row["name"].lower() for row in cursor.fetchall()}
+
+
+def _apply_repair_rule(cursor, rec: dict) -> None:
+    """A visit under a repair type (e.g. Accident repair) keeps the schedule:
+    no next service, so no follow-up. A repair type is never a next service."""
+    repairs = _repair_types(cursor)
+    if (rec["service_type"] or "").lower() in repairs:
+        rec.update(schedule="keep", next_service_date=None, next_service_type=None)
+    elif (rec["next_service_type"] or "").lower() in repairs:
+        raise ValueError(f"{rec['next_service_type']} is a repair, so it can't be the next service.")
+
+
 def _move_bike_on(cursor, vehicle_id: int, record_id: int, rec: dict) -> None:
     """Update the bike from a saved maintenance record `rec` (id `record_id`):
     - readings (odometer, frame/engine numbers) if it's the bike's latest record;
@@ -1372,6 +1411,11 @@ def close_service(appointment_id: str, details: dict, pdf: bytes | None, pdf_nam
         conn.close()
         return (False, f"No open booking with ID {appointment_id}.", None)
     rec["service_type"] = rec["service_type"] or booking["service_type"]
+    try:
+        _apply_repair_rule(cursor, rec)
+    except ValueError as e:
+        conn.close()
+        return (False, str(e), None)
     cursor.execute(f"SELECT {', '.join(BIKE_STATE)} FROM vehicles WHERE id = ?", (booking["vehicle_id"],))
     bike = cursor.fetchone()
     bike_before = json.dumps({column: bike[column] for column in BIKE_STATE}) if bike else None
@@ -1430,6 +1474,11 @@ def record_walk_in_service(vehicle_id: int, details: dict, pdf: bytes | None, pd
     if booking:
         conn.close()
         return (False, f"This bike has booking {booking['id']}. Close that booking with the job card instead.", None)
+    try:
+        _apply_repair_rule(cursor, rec)
+    except ValueError as e:
+        conn.close()
+        return (False, str(e), None)
     cursor.execute(f"SELECT {', '.join(BIKE_STATE)} FROM vehicles WHERE id = ?", (vehicle_id,))
     bike = cursor.fetchone()
     bike_before = json.dumps({column: bike[column] for column in BIKE_STATE})
@@ -1476,6 +1525,11 @@ def update_service_record(record_id: int, details: dict, pdf: bytes | None = Non
         conn.close()
         return (False, "Service record not found.")
     rec["service_type"] = rec["service_type"] or current["service_type"]
+    try:
+        _apply_repair_rule(cursor, rec)
+    except ValueError as e:
+        conn.close()
+        return (False, str(e))
     try:
         assignments = ", ".join(f"{column} = ?" for column in rec)
         cursor.execute(
@@ -2301,6 +2355,7 @@ def get_dashboard_stats() -> dict:
 # ---------------------------------------------------------------------------
 SERVICE_TYPE_FIELDS = (
     "name", "description", "is_free", "interval_days", "interval_km", "price", "overdue_days", "active",
+    "is_repair",
 )
 
 
@@ -2308,6 +2363,7 @@ def _service_type_row(row) -> dict:
     row = _plain(row)
     row["is_free"] = bool(row["is_free"])
     row["active"] = bool(row["active"])
+    row["is_repair"] = bool(row.get("is_repair"))
     return row
 
 
@@ -2345,9 +2401,12 @@ def _clean_service_type(fields: dict) -> tuple[dict, str | None]:
                 return clean, f"{key.replace('_', ' ').capitalize()} must be a whole number."
             if clean[key] < 0 or (key == "interval_days" and clean[key] == 0):
                 return clean, f"{key.replace('_', ' ').capitalize()} must be more than 0."
-    for key in ("is_free", "active"):
+    for key in ("is_free", "active", "is_repair"):
         if key in clean:
             clean[key] = 1 if clean[key] else 0
+    if clean.get("is_repair"):
+        # A repair is never on the schedule (so never followed up).
+        clean["interval_days"] = clean["interval_km"] = None
     if "description" in clean:
         clean["description"] = (clean["description"] or "").strip() or None
     return clean, None
