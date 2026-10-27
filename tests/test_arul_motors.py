@@ -1723,7 +1723,13 @@ def test_bike_from_another_dealer_needs_no_next_service(db, monkeypatch):
     r = client.post("/api/vehicles", json={**base, "bought_elsewhere": True})
     assert r.status_code == 201, r.text
     bike = next(v for v in client.get("/api/vehicles").json() if v["registration_number"] == "TN 69 U 1")
-    assert (bike["next_due_pending"], bike["bought_elsewhere"]) == (1, 1) and bike["next_service_type"]
+    assert (bike["next_due_pending"], bike["bought_elsewhere"]) == (db.PENDING_FIRST_VISIT, 1)
+    # A last service at the other dealer doesn't change that.
+    r = client.post("/api/vehicles", json={**base, "registration_number": "TN 69 U 2", "bought_elsewhere": True,
+                                           "last_service_date": days_ahead(-60)})
+    other = next(v for v in client.get("/api/vehicles").json() if v["registration_number"] == "TN 69 U 2")
+    assert other["next_due_pending"] == db.PENDING_FIRST_VISIT
+    assert "first visit" in bot._pending_note(other)
     assert bike["id"] not in [d["vehicle_id"] for d in client.get("/api/due-services?days=60").json()]
     assert "set at its first visit" in bot._pending_note(bike)
 

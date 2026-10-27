@@ -97,7 +97,8 @@ def build_workbook() -> bytes:
                  (v.get("dealer_name") or "Another dealer") if v.get("bought_elsewhere") else "Arul Motors",
                  _day(v["purchase_date"]), _day(v["last_service_date"]),
                  v["odometer_km"], None if v.get("next_due_pending") else _day(v["next_service_date"]),
-                 f"{v['next_service_type']} (after the oil change)" if v.get("next_due_pending") else v["next_service_type"]]
+                 ("Set at its first visit" if v.get("next_due_pending") == 2
+                  else f"{v['next_service_type']} (after the oil change)" if v.get("next_due_pending") else v["next_service_type"])]
                 if v else ["", "", "", None, None, None, None, ""]
             )
             bike_rows.append(shared + bike + tail)

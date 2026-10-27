@@ -225,7 +225,7 @@ def _today_line() -> str:
 def _pending_note(v: dict) -> str:
     """A next service without a date: set at its first visit here (bought
     elsewhere, never serviced here) or at the next oil change."""
-    if v.get("bought_elsewhere") and not v.get("last_service_date"):
+    if v.get("next_due_pending") == database.PENDING_FIRST_VISIT:
         return "not known yet (set at its first visit here)"
     return "after its next oil change (no date yet)"
 

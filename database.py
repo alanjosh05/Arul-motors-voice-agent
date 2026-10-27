@@ -532,8 +532,9 @@ def init_db():
     # When the bike was added to the CRM (charts filter by it). Bikes added
     # before this column existed have none: they count only in "all time".
     _ensure_column(cursor, "vehicles", "created_at", "TIMESTAMP NULL")
-    # The next service's date is fixed only at the visit where the engine oil is
-    # changed: until then it's "after the oil change" (left out of due lists).
+    # A next service with no date yet (left out of due lists and calls):
+    # PENDING_OIL (1) the oil wasn't changed, the oil-change visit sets it;
+    # PENDING_FIRST_VISIT (2) bought elsewhere, its first visit here sets it.
     _ensure_column(cursor, "vehicles", "next_due_pending", "INTEGER DEFAULT 0")
     # How a record changed the bike's schedule: set (default) / pending (next
     # service after the oil change) / keep (a repair: schedule unchanged).
@@ -657,6 +658,14 @@ def init_db():
 
     # Cancelling deletes a booking outright; clear any left from before that.
     cursor.execute("DELETE FROM service_appointments WHERE status = 'CANCELLED'")
+
+    # Bikes added before the two kinds of "no date yet" were told apart: one
+    # waiting with no service here yet can only be waiting for its first visit.
+    cursor.execute(
+        "UPDATE vehicles SET next_due_pending = ? WHERE next_due_pending = ? AND COALESCE(bought_elsewhere, 0) = 1 "
+        "AND NOT EXISTS (SELECT 1 FROM service_records r WHERE r.vehicle_id = vehicles.id)",
+        (PENDING_FIRST_VISIT, PENDING_OIL),
+    )
 
     # Every model on a bike is on the model list (first run: the list is built
     # from the bikes on record).
@@ -912,7 +921,7 @@ def add_customer_vehicle(
             next_service_type or _first_scheduled_type(cursor),
             1 if bought_elsewhere else 0,
             (dealer_name or "").strip() or None if bought_elsewhere else None,
-            1 if unknown_next else 0,
+            PENDING_FIRST_VISIT if unknown_next else 0,
         ),
     )
     conn.commit()
@@ -1192,6 +1201,9 @@ JOB_TYPES = ["Free service", "Paid service", "Accidental", "Quick repair", "Warr
 #           its date is fixed at the visit where the oil is changed;
 # keep    - a repair (e.g. after an accident): the schedule doesn't change.
 SCHEDULE_CHOICES = ("set", "pending", "keep")
+# vehicles.next_due_pending: why a next service has no date yet (0 = it has one).
+PENDING_OIL = 1  # serviced without an oil change: the oil-change visit sets it
+PENDING_FIRST_VISIT = 2  # bought elsewhere, not serviced here yet: its first visit sets it
 DEFAULT_INTERVAL_DAYS = 90
 FEEDBACK_RATINGS = ["Excellent", "Very good", "Good", "Average", "Below expectation"]
 FEEDBACK_CHECKS = ["delivery_on_time", "washing_quality", "staff_behaviour", "fairness_of_charges", "repairing_quality"]
@@ -1441,8 +1453,8 @@ def _move_bike_on(cursor, vehicle_id: int, record_id: int, rec: dict) -> None:
         days = (row and row["interval_days"]) or DEFAULT_INTERVAL_DAYS
         estimate = (date.fromisoformat(rec["service_date"]) + timedelta(days=days)).isoformat()
         cursor.execute(
-            "UPDATE vehicles SET next_service_date = ?, next_service_type = ?, next_due_pending = 1 WHERE id = ?",
-            (estimate, rec["next_service_type"], vehicle_id),
+            "UPDATE vehicles SET next_service_date = ?, next_service_type = ?, next_due_pending = ? WHERE id = ?",
+            (estimate, rec["next_service_type"], PENDING_OIL, vehicle_id),
         )
     elif rec["next_service_date"]:
         cursor.execute(
