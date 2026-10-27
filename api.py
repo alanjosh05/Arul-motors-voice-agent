@@ -1088,6 +1088,37 @@ class ShowroomStaffPatch(BaseModel):
     active: bool | None = None
 
 
+# ---------------------------------------------------------------------------
+# Bike models (Bikes page)
+# ---------------------------------------------------------------------------
+class BikeModelIn(BaseModel):
+    name: str
+
+
+@api.get("/bike-models")
+def get_bike_models():
+    """Every model with its bikes, customers, due-soon, bought-elsewhere and service counts."""
+    return database.list_bike_models()
+
+
+@api.post("/bike-models", status_code=201)
+def add_bike_model(body: BikeModelIn):
+    ok, message, model_id = database.create_bike_model(body.name)
+    if not ok:
+        raise HTTPException(status_code=400, detail=message)
+    return {"message": message, "id": model_id}
+
+
+@api.patch("/bike-models/{model_id}")
+def rename_bike_model(model_id: int, body: BikeModelIn):
+    return _check(database.update_bike_model(model_id, body.name))
+
+
+@api.delete("/bike-models/{model_id}")
+def remove_bike_model(model_id: int):
+    return _check(database.delete_bike_model(model_id))
+
+
 class StaffCategoryIn(BaseModel):
     name: str
     is_mechanic: bool = False  # its people are the job card's mechanic list

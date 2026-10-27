@@ -387,6 +387,17 @@ def init_db():
     ) {t['table']}
     """)
 
+    # Bike models the showroom deals with (Bikes page): the bike form's model
+    # list. Bikes store the model's name (renames cascade). Any model on a bike
+    # but not on the list is added at the end of init_db.
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS bike_models (
+        id {t['pk']},
+        name {t['str']} NOT NULL UNIQUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) {t['table']}
+    """)
+
     # Our staff's categories, managed by admins. Staff store the category's
     # name (renames cascade). `is_mechanic`: its people are the job card's
     # mechanic list. Seeded once with Sales, Spares and Mechanic.
@@ -644,6 +655,13 @@ def init_db():
     # Cancelling deletes a booking outright; clear any left from before that.
     cursor.execute("DELETE FROM service_appointments WHERE status = 'CANCELLED'")
 
+    # Every model on a bike is on the model list (first run: the list is built
+    # from the bikes on record).
+    cursor.execute("SELECT DISTINCT model FROM vehicles")
+    for row in cursor.fetchall():
+        if _tidy_model(row["model"]):
+            _register_model(cursor, row["model"])
+
     conn.commit()
     conn.close()
     logger.info("Database initialized")
@@ -847,6 +865,7 @@ def add_customer_vehicle(
     if cursor.fetchone():
         conn.close()
         return (False, f"Bike {registration_number} already exists.")
+    model = _register_model(cursor, model)
 
     cursor.execute("SELECT id FROM customers WHERE mobile_number = ?", (mobile_number,))
     row = cursor.fetchone()
@@ -880,7 +899,7 @@ def add_customer_vehicle(
     )
     conn.commit()
     conn.close()
-    _record_change(["customers", "vehicles", "due", "stats"], customer_id)
+    _record_change(["customers", "vehicles", "due", "stats", "bike_models"], customer_id)
     return (True, f"{registration_number} added for {name}.")
 
 
@@ -2181,6 +2200,8 @@ def update_vehicle(vehicle_id: int, **changes) -> tuple[bool, str]:
             changes[key] = day
     if "registration_number" in changes:
         changes["registration_number"] = changes["registration_number"].strip().upper()
+    if "model" in changes and not _tidy_model(changes["model"]):
+        return (False, "Choose the bike model.")
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute("SELECT id, next_service_date FROM vehicles WHERE id = ?", (vehicle_id,))
@@ -2196,13 +2217,15 @@ def update_vehicle(vehicle_id: int, **changes) -> tuple[bool, str]:
         if cursor.fetchone():
             conn.close()
             return (False, f"Bike {changes['registration_number']} already exists.")
+    if "model" in changes:
+        changes["model"] = _register_model(cursor, changes["model"])
     if changes.get("next_service_date") not in (None, current["next_service_date"]):
         changes["next_due_pending"] = 0  # a new date typed in by hand is a fixed date
     assignments = ", ".join(f"{key} = ?" for key in changes)
     cursor.execute(f"UPDATE vehicles SET {assignments} WHERE id = ?", (*changes.values(), vehicle_id))
     conn.commit()
     conn.close()
-    _record_change(["vehicles", "customers", "due", "stats"])
+    _record_change(["vehicles", "customers", "due", "stats", "bike_models"])
     return (True, "Bike updated.")
 
 
@@ -2386,6 +2409,126 @@ def get_dashboard_stats() -> dict:
 # ---------------------------------------------------------------------------
 # Service types (managed from the CRM)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Bike models (Bikes page): the bike form's model list
+# ---------------------------------------------------------------------------
+def _tidy_model(name: str | None) -> str:
+    return re.sub(r"\s+", " ", name or "").strip()
+
+
+def _register_model(cursor, name: str) -> str:
+    """The model's catalog name (any case/spacing). A model not in the catalog
+    yet (the agent, the Excel import, older forms) is added, so the list
+    always covers every bike."""
+    name = _tidy_model(name)
+    cursor.execute("SELECT name FROM bike_models WHERE LOWER(name) = LOWER(?)", (name,))
+    row = cursor.fetchone()
+    if row:
+        return row["name"]
+    cursor.execute("INSERT INTO bike_models (name) VALUES (?)", (name,))
+    return name  # callers record the change (with "bike_models") after committing
+
+
+def list_bike_models() -> list:
+    """Every model with how many bikes and customers have it, how many are due
+    this week, bought elsewhere and serviced (most customers first)."""
+    week = (today() + timedelta(days=7)).isoformat()
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM bike_models")
+    models = [_plain(r) for r in cursor.fetchall()]
+    cursor.execute(
+        """
+    SELECT LOWER(v.model) AS model, count(*) AS bikes, count(DISTINCT v.customer_id) AS customers,
+           sum(CASE WHEN v.next_service_date <= ? AND COALESCE(v.next_due_pending, 0) = 0 THEN 1 ELSE 0 END) AS due_soon,
+           sum(CASE WHEN COALESCE(v.bought_elsewhere, 0) = 1 THEN 1 ELSE 0 END) AS bought_elsewhere
+    FROM vehicles v GROUP BY LOWER(v.model)
+    """,
+        (week,),
+    )
+    stats = {r["model"]: _plain(r) for r in cursor.fetchall()}
+    cursor.execute(
+        "SELECT LOWER(v.model) AS model, count(*) AS n FROM service_records r JOIN vehicles v ON v.id = r.vehicle_id GROUP BY LOWER(v.model)"
+    )
+    services = {r["model"]: r["n"] for r in cursor.fetchall()}
+    conn.close()
+    for m in models:
+        st = stats.get(m["name"].lower(), {})
+        m.update(
+            bikes=st.get("bikes", 0), customers=st.get("customers", 0), due_soon=int(st.get("due_soon") or 0),
+            bought_elsewhere=int(st.get("bought_elsewhere") or 0), services=services.get(m["name"].lower(), 0),
+        )
+    return sorted(models, key=lambda m: (-m["customers"], -m["bikes"], m["name"].lower()))
+
+
+def create_bike_model(name: str) -> tuple[bool, str, int | None]:
+    name = _tidy_model(name)
+    if not name:
+        return (False, "Enter the model's name.", None)
+    if len(name) > 80:
+        return (False, "Keep the name under 80 characters.", None)
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM bike_models WHERE LOWER(name) = LOWER(?)", (name,))
+    row = cursor.fetchone()
+    if row:
+        conn.close()
+        return (False, f"{row['name']} is already on the list.", None)
+    cursor.execute("INSERT INTO bike_models (name) VALUES (?)", (name,))
+    model_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    _record_change(["bike_models"])
+    return (True, f"{name} added.", model_id)
+
+
+def update_bike_model(model_id: int, name: str) -> tuple[bool, str]:
+    """Rename a model; its bikes are renamed with it."""
+    name = _tidy_model(name)
+    if not name:
+        return (False, "Enter the model's name.")
+    if len(name) > 80:
+        return (False, "Keep the name under 80 characters.")
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM bike_models WHERE id = ?", (model_id,))
+    current = cursor.fetchone()
+    if not current:
+        conn.close()
+        return (False, "Bike model not found.")
+    cursor.execute("SELECT id FROM bike_models WHERE LOWER(name) = LOWER(?) AND id != ?", (name, model_id))
+    if cursor.fetchone():
+        conn.close()
+        return (False, f"{name} is already on the list.")
+    cursor.execute("UPDATE bike_models SET name = ? WHERE id = ?", (name, model_id))
+    cursor.execute("UPDATE vehicles SET model = ? WHERE LOWER(model) = LOWER(?)", (name, current["name"]))
+    conn.commit()
+    conn.close()
+    _record_change(["bike_models", "vehicles", "customers"])
+    return (True, f"Renamed to {name}.")
+
+
+def delete_bike_model(model_id: int) -> tuple[bool, str]:
+    """Delete a model no bike uses."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM bike_models WHERE id = ?", (model_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return (False, "Bike model not found.")
+    cursor.execute("SELECT count(*) AS n FROM vehicles WHERE LOWER(model) = LOWER(?)", (row["name"],))
+    bikes = cursor.fetchone()["n"]
+    if bikes:
+        conn.close()
+        return (False, f"{bikes} bike(s) are {row['name']}. Change their model first, then delete it.")
+    cursor.execute("DELETE FROM bike_models WHERE id = ?", (model_id,))
+    conn.commit()
+    conn.close()
+    _record_change(["bike_models"])
+    return (True, f"{row['name']} deleted.")
+
+
 # ---------------------------------------------------------------------------
 # Our staff (the showroom's people, not CRM logins)
 # ---------------------------------------------------------------------------

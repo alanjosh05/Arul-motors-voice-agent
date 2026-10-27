@@ -1636,3 +1636,41 @@ def test_admins_manage_our_staff_categories(db, monkeypatch):
     mech = next(c for c in cats if c["name"] == "Mechanic")
     assert admin.patch(f"/api/staff-categories/{mech['id']}", json={"name": "Technician", "is_mechanic": True}).status_code == 200
     assert next(c for c in staff.get("/api/staff-categories").json() if c["id"] == mech["id"])["name"] == "Technician"
+
+
+def test_bike_models_catalog(db, monkeypatch):
+    """Bikes page: the model list. Filled from the bikes on record; add,
+    rename (bikes follow) and delete unused models; per-model counts; a bike
+    with a model not on the list (agent, import) adds it."""
+    client = _api_client(monkeypatch, admin=False)
+    models = {m["name"]: m for m in client.get("/api/bike-models").json()}
+    assert "Yamaha FZ-S Fi" in models and models["Yamaha FZ-S Fi"]["bikes"] == 1 and models["Yamaha FZ-S Fi"]["customers"] == 1
+
+    r = client.post("/api/bike-models", json={"name": "  Yamaha  MT-15 V2 "})
+    assert r.status_code == 201, r.text
+    mt = r.json()["id"]
+    assert client.post("/api/bike-models", json={"name": "yamaha mt-15 v2"}).status_code == 400  # duplicate
+    assert client.post("/api/bike-models", json={"name": " "}).status_code == 400
+
+    # A bike in any case/spacing uses the catalog name; a new model is added.
+    karthik = db.get_customer_by_mobile("9876543210")
+    assert client.post("/api/vehicles", json={"name": karthik["name"], "mobile_number": karthik["mobile_number"],
+        "registration_number": "TN 69 Z 1", "model": "yamaha mt-15   v2", "next_service_date": days_ahead(30),
+        "next_service_type": "First free service"}).status_code == 201
+    assert client.post("/api/vehicles", json={"name": "New Person", "mobile_number": "9000022222",
+        "registration_number": "TN 69 Z 2", "model": "Yamaha Aerox 155", "next_service_date": days_ahead(30),
+        "next_service_type": "First free service"}).status_code == 201
+    models = {m["name"]: m for m in client.get("/api/bike-models").json()}
+    assert models["Yamaha MT-15 V2"]["bikes"] == 1 and "Yamaha Aerox 155" in models
+    bike = next(v for v in client.get("/api/vehicles").json() if v["registration_number"] == "TN 69 Z 1")
+    assert bike["model"] == "Yamaha MT-15 V2"
+
+    # Rename: the bikes follow. Delete: only when no bike uses it.
+    assert client.patch(f"/api/bike-models/{mt}", json={"name": "Yamaha MT-15 Version 2"}).status_code == 200
+    bike = next(v for v in client.get("/api/vehicles").json() if v["registration_number"] == "TN 69 Z 1")
+    assert bike["model"] == "Yamaha MT-15 Version 2"
+    r = client.delete(f"/api/bike-models/{mt}")
+    assert r.status_code == 400 and "Change their model first" in r.json()["detail"]
+    client.delete(f"/api/vehicles/{bike['id']}")
+    assert client.delete(f"/api/bike-models/{mt}").status_code == 200
+    assert client.delete(f"/api/bike-models/{mt}").status_code == 404
