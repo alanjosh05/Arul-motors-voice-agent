@@ -222,6 +222,14 @@ def _today_line() -> str:
     return f"{now.strftime('%a %d %b %Y')} ({now.date().isoformat()}), {now.strftime('%H:%M')} IST. Next days: {days}"
 
 
+def _pending_note(v: dict) -> str:
+    """A next service without a date: set at its first visit here (bought
+    elsewhere, never serviced here) or at the next oil change."""
+    if v.get("bought_elsewhere") and not v.get("last_service_date"):
+        return "not known yet (set at its first visit here)"
+    return "after its next oil change (no date yet)"
+
+
 def _bought(v: dict) -> str:
     """Where the bike was bought: many serviced here were bought from another
     dealer (so the agent never says "you bought it from us")."""
@@ -236,7 +244,7 @@ def build_system_instruction(customer: dict) -> str:
     Gemini Live re-reads the whole prompt every turn."""
     vehicles = "\n".join(
         f"- {v['model']} {v['registration_number']}: {v['next_service_type']} due "
-        f"{'after its next oil change (no date yet)' if v.get('next_due_pending') else _say_date(v['next_service_date'])}; {_bought(v)}, "
+        f"{_pending_note(v) if v.get('next_due_pending') else _say_date(v['next_service_date'])}; {_bought(v)}, "
         f"~{v['odometer_km'] or 0} km, last service {_say_date(v['last_service_date'])}"
         for v in customer["vehicles"]
     )

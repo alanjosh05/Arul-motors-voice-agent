@@ -1707,3 +1707,31 @@ def test_chart_ranges(db, monkeypatch):
     assert client.get("/api/charts/calls", params={"start": days_ahead(0), "end": days_ahead(-1)}).status_code == 400
     assert client.get("/api/charts/calls", params={"start": days_ahead(-400), "end": days_ahead(0)}).status_code == 400
     assert client.get("/api/charts/bookings", params={"start": "x", "end": days_ahead(0)}).status_code == 400
+
+
+def test_bike_from_another_dealer_needs_no_next_service(db, monkeypatch):
+    """A bike bought elsewhere can be added without its next service: it waits
+    (no follow-up call) until its first visit here sets the date. A bike sold
+    here still needs one."""
+    import json
+
+    import bot
+
+    client = _api_client(monkeypatch, admin=False)
+    base = {"name": "Unknown Next", "mobile_number": "9000044444", "registration_number": "TN 69 U 1", "model": "Yamaha FZ-S Fi"}
+    assert client.post("/api/vehicles", json=base).status_code == 400  # sold here: next service required
+    r = client.post("/api/vehicles", json={**base, "bought_elsewhere": True})
+    assert r.status_code == 201, r.text
+    bike = next(v for v in client.get("/api/vehicles").json() if v["registration_number"] == "TN 69 U 1")
+    assert (bike["next_due_pending"], bike["bought_elsewhere"]) == (1, 1) and bike["next_service_type"]
+    assert bike["id"] not in [d["vehicle_id"] for d in client.get("/api/due-services?days=60").json()]
+    assert "set at its first visit" in bot._pending_note(bike)
+
+    # Its first visit (a walk-in) sets the next service.
+    form = {"service_date": days_ahead(0), "service_type": "Second free service", "odometer_km": "8000",
+            "jobs_done": json.dumps(["Engine oil change"]), "next_service_type": "Third free service",
+            "next_service_date": days_ahead(90)}
+    assert client.post(f"/api/vehicles/{bike['id']}/services", data=form,
+                       files={"report": ("a.pdf", PDF, "application/pdf")}).status_code == 201
+    bike = next(v for v in client.get("/api/vehicles").json() if v["id"] == bike["id"])
+    assert (bike["next_due_pending"], bike["next_service_type"], bike["next_service_date"]) == (0, "Third free service", days_ahead(90))

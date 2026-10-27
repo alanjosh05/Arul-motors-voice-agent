@@ -675,6 +675,13 @@ def _next_appointment_id(cursor) -> str:
     return f"AM{1001 + cursor.fetchone()['n']}"
 
 
+def _first_scheduled_type(cursor) -> str:
+    """The first service in the workshop's schedule (a placeholder type)."""
+    cursor.execute("SELECT name FROM service_types WHERE interval_days IS NOT NULL ORDER BY sort_order, id LIMIT 1")
+    row = cursor.fetchone()
+    return row["name"] if row else SERVICE_SEQUENCE[0]
+
+
 def _previous_service_type(cursor, next_service_type: str) -> str:
     """The service before `next_service_type` in the workshop's schedule (the
     scheduled service types, in order)."""
@@ -840,8 +847,8 @@ def add_customer_vehicle(
     mobile_number: str,
     registration_number: str,
     model: str,
-    next_service_date: str,
-    next_service_type: str,
+    next_service_date: str | None = None,
+    next_service_type: str | None = None,
     purchase_date: str | None = None,
     odometer_km: int | None = None,
     last_service_date: str | None = None,
@@ -855,8 +862,14 @@ def add_customer_vehicle(
     name = (name or "").strip()
     mobile_number = (mobile_number or "").strip()
     registration_number = (registration_number or "").strip().upper()
-    due = normalize_date(next_service_date)
-    if not all([name, mobile_number, registration_number, model, next_service_type]) or not due:
+    due = normalize_date(next_service_date) if next_service_date else None
+    # Bought from another dealer: its next service is usually not known until
+    # it first comes in, so it can be left out. The bike then waits (no
+    # follow-up call) and that visit sets the date.
+    unknown_next = bought_elsewhere and not due and not next_service_type
+    if next_service_date and not due:
+        return (False, "Invalid next service date.")
+    if not all([name, mobile_number, registration_number, model]) or not (unknown_next or (due and next_service_type)):
         return (False, "Name, mobile, registration, model, service type and a valid due date are required.")
     alternate_mobile, error = _check_alternate(alternate_mobile, mobile_number)
     if error:
@@ -884,8 +897,8 @@ def add_customer_vehicle(
     cursor.execute(
         """
     INSERT INTO vehicles (customer_id, registration_number, model, purchase_date, last_service_date, odometer_km,
-                          next_service_date, next_service_type, bought_elsewhere, dealer_name, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                          next_service_date, next_service_type, bought_elsewhere, dealer_name, next_due_pending, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """,
         (
             customer_id,
@@ -894,10 +907,12 @@ def add_customer_vehicle(
             normalize_date(purchase_date),
             normalize_date(last_service_date),
             odometer_km,
-            due,
-            next_service_type,
+            # Unknown next service: today as a placeholder (never called: pending).
+            due or today().isoformat(),
+            next_service_type or _first_scheduled_type(cursor),
             1 if bought_elsewhere else 0,
             (dealer_name or "").strip() or None if bought_elsewhere else None,
+            1 if unknown_next else 0,
         ),
     )
     conn.commit()

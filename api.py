@@ -466,8 +466,8 @@ class VehicleIn(BaseModel):
     mobile_number: str
     registration_number: str
     model: str
-    next_service_date: str
-    next_service_type: str
+    next_service_date: str | None = None  # may be left out for a bike bought elsewhere
+    next_service_type: str | None = None
     purchase_date: str | None = None
     odometer_km: int | None = None
     last_service_date: str | None = None
