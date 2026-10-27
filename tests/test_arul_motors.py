@@ -1674,3 +1674,36 @@ def test_bike_models_catalog(db, monkeypatch):
     client.delete(f"/api/vehicles/{bike['id']}")
     assert client.delete(f"/api/bike-models/{mt}").status_code == 200
     assert client.delete(f"/api/bike-models/{mt}").status_code == 404
+
+
+def test_chart_ranges(db, monkeypatch):
+    """Charts take a date range: bookings per day, calls per day and by
+    outcome, and bikes per model among bikes added in the range."""
+    client = _api_client(monkeypatch, admin=False)
+    aid = client.post("/api/appointments", json={"customer_id": 1, "appointment_date": days_ahead(2)}).json()["id"]
+    db.log_call(1, "date_confirmed", appointment_id=aid)
+    db.log_call(2, "no_answer")
+
+    days = client.get("/api/charts/bookings", params={"start": days_ahead(0), "end": days_ahead(6)}).json()
+    assert len(days) == 7 and sum(d["count"] for d in days) >= 1
+    assert next(d for d in days if d["date"] == days_ahead(2))["count"] >= 1
+
+    calls = client.get("/api/charts/calls", params={"start": days_ahead(-6), "end": days_ahead(0)}).json()
+    assert calls["total"] == 2 and len(calls["per_day"]) == 7
+    assert {o["outcome"]: o["count"] for o in calls["outcomes"]}["no_answer"] == 1
+    old = client.get("/api/charts/calls", params={"start": days_ahead(-40), "end": days_ahead(-31)}).json()
+    assert old["total"] == 0
+
+    # Bike models: all time vs bikes added in the range (seeded bikes have no add date).
+    everything = client.get("/api/charts/bike-models").json()
+    assert sum(m["bikes"] for m in everything) == len(client.get("/api/vehicles").json())
+    assert client.get("/api/charts/bike-models", params={"start": days_ahead(-6), "end": days_ahead(0)}).json() == []
+    client.post("/api/vehicles", json={"name": "Range Test", "mobile_number": "9000033333", "registration_number": "TN 69 R 1",
+        "model": "Yamaha FZ-S Fi", "next_service_date": days_ahead(30), "next_service_type": "First free service"})
+    week = client.get("/api/charts/bike-models", params={"start": days_ahead(-6), "end": days_ahead(0)}).json()
+    assert week == [{"name": "Yamaha FZ-S Fi", "bikes": 1, "customers": 1, "bought_elsewhere": 0}]
+
+    # Bad ranges.
+    assert client.get("/api/charts/calls", params={"start": days_ahead(0), "end": days_ahead(-1)}).status_code == 400
+    assert client.get("/api/charts/calls", params={"start": days_ahead(-400), "end": days_ahead(0)}).status_code == 400
+    assert client.get("/api/charts/bookings", params={"start": "x", "end": days_ahead(0)}).status_code == 400

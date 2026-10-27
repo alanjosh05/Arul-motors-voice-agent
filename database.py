@@ -529,6 +529,9 @@ def init_db():
     # date is then often unknown, and the first visit can be any service.
     _ensure_column(cursor, "vehicles", "bought_elsewhere", "INTEGER DEFAULT 0")
     _ensure_column(cursor, "vehicles", "dealer_name", t["str"])
+    # When the bike was added to the CRM (charts filter by it). Bikes added
+    # before this column existed have none: they count only in "all time".
+    _ensure_column(cursor, "vehicles", "created_at", "TIMESTAMP NULL")
     # The next service's date is fixed only at the visit where the engine oil is
     # changed: until then it's "after the oil change" (left out of due lists).
     _ensure_column(cursor, "vehicles", "next_due_pending", "INTEGER DEFAULT 0")
@@ -881,8 +884,8 @@ def add_customer_vehicle(
     cursor.execute(
         """
     INSERT INTO vehicles (customer_id, registration_number, model, purchase_date, last_service_date, odometer_km,
-                          next_service_date, next_service_type, bought_elsewhere, dealer_name)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          next_service_date, next_service_type, bought_elsewhere, dealer_name, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """,
         (
             customer_id,
@@ -2404,6 +2407,95 @@ def get_dashboard_stats() -> dict:
         "recent_services": done[:8],
         "recent_calls": calls_30[:6] if len(calls_30) >= 6 else get_call_logs(limit=6),
     }
+
+
+# ---------------------------------------------------------------------------
+# Charts with a date range (dashboard, Bikes page)
+# ---------------------------------------------------------------------------
+MAX_CHART_DAYS = 366
+
+
+def _chart_range(start: str | None, end: str | None) -> tuple[date, date]:
+    """Inclusive showroom-date range from 'YYYY-MM-DD' strings; at most a year."""
+    first, last = normalize_date(start), normalize_date(end)
+    if not first or not last:
+        raise ValueError("Give the range as start and end dates (YYYY-MM-DD).")
+    a, b = date.fromisoformat(first), date.fromisoformat(last)
+    if b < a:
+        raise ValueError("The range ends before it starts.")
+    if (b - a).days + 1 > MAX_CHART_DAYS:
+        raise ValueError(f"Pick a range of at most {MAX_CHART_DAYS} days.")
+    return a, b
+
+
+def _days(a: date, b: date) -> list[str]:
+    return [(a + timedelta(days=i)).isoformat() for i in range((b - a).days + 1)]
+
+
+def chart_bookings(start: str, end: str) -> list:
+    """Bookings per day (upcoming and serviced) between start and end."""
+    a, b = _chart_range(start, end)
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT appointment_date AS day, count(*) AS n FROM service_appointments "
+        "WHERE status IN ('CONFIRMED', 'COMPLETED') AND appointment_date BETWEEN ? AND ? GROUP BY appointment_date",
+        (a.isoformat(), b.isoformat()),
+    )
+    counts = {r["day"]: r["n"] for r in cursor.fetchall()}
+    conn.close()
+    return [{"date": d, "count": counts.get(d, 0)} for d in _days(a, b)]
+
+
+def chart_calls(start: str, end: str) -> dict:
+    """Calls between start and end (showroom dates): per day (all / date
+    confirmed), by outcome, and the total."""
+    a, b = _chart_range(start, end)
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT created_at, outcome FROM call_logs WHERE created_at >= ? AND created_at < ?",
+        (_ist_day_start_utc(a), _ist_day_start_utc(b + timedelta(days=1))),
+    )
+    calls = [(_ist_day(r["created_at"]), r["outcome"]) for r in cursor.fetchall()]
+    conn.close()
+    per_day: dict[str, list[int]] = {}
+    outcomes = {outcome: 0 for outcome in sorted(CALL_OUTCOMES)}
+    for day, outcome in calls:
+        totals = per_day.setdefault(day, [0, 0])
+        totals[0] += 1
+        totals[1] += outcome == "date_confirmed"
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+    return {
+        "per_day": [{"date": d, "total": per_day.get(d, [0, 0])[0], "confirmed": per_day.get(d, [0, 0])[1]} for d in _days(a, b)],
+        "outcomes": [{"outcome": k, "count": v} for k, v in outcomes.items()],
+        "total": len(calls),
+    }
+
+
+def chart_bike_models(start: str | None = None, end: str | None = None) -> list:
+    """Per model: bikes, customers and bought-elsewhere among bikes added to the
+    CRM between start and end (no range: every bike). Most customers first."""
+    where, params = "", ()
+    if start or end:
+        a, b = _chart_range(start, end)
+        where = "WHERE v.created_at >= ? AND v.created_at < ?"
+        params = (_ist_day_start_utc(a), _ist_day_start_utc(b + timedelta(days=1)))
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+    SELECT COALESCE(m.name, v.model) AS name, count(*) AS bikes, count(DISTINCT v.customer_id) AS customers,
+           sum(CASE WHEN COALESCE(v.bought_elsewhere, 0) = 1 THEN 1 ELSE 0 END) AS bought_elsewhere
+    FROM vehicles v LEFT JOIN bike_models m ON LOWER(m.name) = LOWER(v.model)
+    {where}
+    GROUP BY COALESCE(m.name, v.model)
+    """,
+        params,
+    )
+    rows = [{**_plain(r), "bought_elsewhere": int(r["bought_elsewhere"] or 0)} for r in cursor.fetchall()]
+    conn.close()
+    return sorted(rows, key=lambda r: (-r["customers"], -r["bikes"], r["name"].lower()))
 
 
 # ---------------------------------------------------------------------------

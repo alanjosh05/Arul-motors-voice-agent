@@ -330,6 +330,8 @@ Scripts may use `X-API-Key: <API_KEY>` instead.
 | `/api/vehicles/{id}/services` | POST | Record a walk-in service (no booking): same form; `service_type` required |
 | `/api/showroom-staff` | GET · POST | Our staff: the showroom's people (by category; not logins). List: any user (job card mechanic list); add: admins |
 | `/api/showroom-staff/{id}` | PATCH · DELETE | Edit (name, category, mobile, `active` = working here) or remove: admins |
+| `/api/charts/bookings` · `/api/charts/calls` | GET | Chart data for a date range (`start`, `end`: YYYY-MM-DD, up to a year): bookings per day; calls per day, by outcome and total |
+| `/api/charts/bike-models` | GET | Per model among bikes added to the CRM in `start`–`end` (no range: all bikes; bikes added before `vehicles.created_at` existed count only there) |
 | `/api/bike-models` | GET · POST | The bike model list (Bikes page), with bikes / customers / due-this-week / bought-elsewhere / services per model; add one |
 | `/api/bike-models/{id}` | PATCH · DELETE | Rename (its bikes follow) or delete a model no bike uses |
 | `/api/staff-categories` | GET · POST | Our staff's categories (Sales / Spares / Mechanic to start); add: admins. `is_mechanic`: its people are the job card's mechanic list |

@@ -1089,6 +1089,34 @@ class ShowroomStaffPatch(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Charts with a date range (start / end: showroom dates, YYYY-MM-DD)
+# ---------------------------------------------------------------------------
+def _chart(fn, *args):
+    try:
+        return fn(*args)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@api.get("/charts/bookings")
+def chart_bookings(start: str, end: str):
+    """Bookings per day (upcoming and serviced)."""
+    return _chart(database.chart_bookings, start, end)
+
+
+@api.get("/charts/calls")
+def chart_calls(start: str, end: str):
+    """Calls per day, by outcome, and the total."""
+    return _chart(database.chart_calls, start, end)
+
+
+@api.get("/charts/bike-models")
+def chart_bike_models(start: str | None = None, end: str | None = None):
+    """Per model, among bikes added between start and end (none: all bikes)."""
+    return _chart(database.chart_bike_models, start, end)
+
+
+# ---------------------------------------------------------------------------
 # Bike models (Bikes page)
 # ---------------------------------------------------------------------------
 class BikeModelIn(BaseModel):
