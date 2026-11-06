@@ -52,8 +52,14 @@ def db(request, tmp_path, monkeypatch):
         monkeypatch.setenv("SEED_DEMO", "1")
         conn = database._connect()
         cursor = conn.cursor()
-        for table in MYSQL_TABLES:
-            cursor.execute(f"DROP TABLE IF EXISTS {table}")
+        # Every table, not just the original four: rows left in newer tables
+        # (e.g. customer_services) would match the next test's customer ids.
+        cursor.execute("SHOW TABLES")
+        tables = [next(iter(row.values())) if isinstance(row, dict) else row[0] for row in cursor.fetchall()]
+        cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+        for table in tables:
+            cursor.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
         conn.commit()
         conn.close()
     database.init_db()
@@ -1542,8 +1548,6 @@ def test_accident_repair_type_is_recorded_without_any_follow_up(db, monkeypatch)
     a visit under it is recorded with its job card but never changes the
     bike's schedule, so it never leads to a follow-up; it can't be a bike's
     next service either."""
-    import json
-
     staff = _api_client(monkeypatch, admin=False)
     types = {t["name"]: t for t in staff.get("/api/service-types").json()}
     assert types["Accident repair"]["is_repair"] is True and types["Accident repair"]["interval_days"] is None
@@ -1801,3 +1805,142 @@ def test_insurance_call_prompt(db):
     prompt = bot.build_system_instruction(customer)
     assert "INSURANCE is expiring" in prompt and "insurance expires on" in prompt
     assert db.log_call(1, "insurance_reminded")[0] and db.log_call(1, "insurance_renewed")[0]
+
+
+# ---------------------------------------------------------------------------
+# Pipeline guards: what must hold before any push goes live
+# ---------------------------------------------------------------------------
+PUBLIC_ROUTES = {"/api/health", "/api/auth/login"}
+
+
+def test_every_api_route_needs_a_login(db, monkeypatch):
+    """Walks the real route table: any /api route added later that forgets its
+    login check fails here, before it can be deployed."""
+    import re
+
+    from fastapi.testclient import TestClient
+
+    import api
+
+    client = TestClient(api.app)
+    checked = 0
+    # The OpenAPI document lists every route however the routers are nested.
+    for template, methods in api.app.openapi()["paths"].items():
+        if not template.startswith("/api") or template in PUBLIC_ROUTES:
+            continue
+        path = re.sub(r"\{[^}]+\}", "1", template)  # path params: any value
+        for method in methods:
+            response = client.request(method.upper(), path)
+            assert response.status_code == 401, f"{method.upper()} {template} answered {response.status_code} without a login"
+            checked += 1
+    assert checked > 40  # the whole CRM surface, not an empty loop
+
+
+def test_health_is_public_and_reports_the_deployed_version(db, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import api
+
+    body = TestClient(api.app).get("/api/health").json()
+    assert body["status"] == "ok" and body["version"] == api.DEPLOYED_VERSION and "shift" in body
+
+
+def test_customer_services_and_insurance_over_the_api(db, monkeypatch):
+    client = _api_client(monkeypatch)
+    made = client.post("/api/customers", json={"name": "Api Svc", "mobile_number": "9000044444",
+                                               "service_types": ["First free service", "Paid service"]})
+    assert made.status_code == 201
+    cid = made.json()["id"]
+    assert client.get(f"/api/customers/{cid}").json()["service_types"] == ["First free service", "Paid service"]
+    assert client.post("/api/customers", json={"name": "X", "mobile_number": "9000055555",
+                                               "service_types": ["Accident repair"]}).status_code == 400
+    sale = {"name": "Api Svc", "mobile_number": "9000044444", "registration_number": "TN69AP0001", "model": "FZ",
+            "next_service_date": days_ahead(20), "next_service_type": "Second free service"}
+    assert client.post("/api/vehicles", json=sale).status_code == 400  # not one of this customer's services
+    sale["next_service_type"] = "Paid service"
+    sale.update(insurance_provider="New India", insurance_policy_no="P1", insurance_expiry=days_ahead(10))
+    assert client.post("/api/vehicles", json=sale).status_code == 201
+    bike = client.get(f"/api/customers/{cid}").json()["vehicles"][0]
+    assert bike["insurance_expiry"] == days_ahead(10)
+    assert client.patch(f"/api/vehicles/{bike['id']}", json={"insurance_expiry": "not a date"}).status_code == 400
+    assert client.patch(f"/api/vehicles/{bike['id']}", json={"insurance_expiry": ""}).status_code == 200
+    assert client.get(f"/api/customers/{cid}").json()["vehicles"][0]["insurance_expiry"] is None
+
+
+def test_voice_offer_purpose_is_limited_to_known_values(db, monkeypatch):
+    """The call's purpose reaches the bot only as 'service' or 'insurance'."""
+    import api
+
+    assert api.voice_offer.__name__ == "voice_offer"
+    source = open(api.__file__).read()
+    assert 'purpose = "insurance" if request_data.get("purpose") == "insurance" else "service"' in source
+
+
+def test_startup_upgrades_an_old_database_without_losing_data(db, tmp_path):
+    """A deploy runs init_db on the live database. Simulate one from before
+    the newest columns and tables existed: it must upgrade in place, keep every
+    row, and be safe to run again."""
+    import sqlite3
+
+    database = db
+    if database.using_mysql():
+        pytest.skip("simulates an old SQLite file (production uses SQLite)")
+    database.init_db()
+    ok, _ = database.add_customer_vehicle("Old Timer", "9000066666", "TN69OL0001", "FZ", days_ahead(30), "Paid service",
+                                          insurance_expiry=days_ahead(5))
+    assert ok
+    conn = sqlite3.connect(database.DB_FILE)
+    for column in ("insurance_provider", "insurance_policy_no", "insurance_expiry", "next_due_pending", "bought_elsewhere"):
+        conn.execute(f"ALTER TABLE vehicles DROP COLUMN {column}")
+    conn.execute("DROP TABLE customer_services")
+    conn.commit()
+    conn.close()
+
+    database.init_db()
+    database.init_db()  # idempotent
+    bike = next(v for v in database.list_vehicles() if v["registration_number"] == "TN69OL0001")
+    assert bike["customer_name"] == "Old Timer" and bike["next_service_type"] == "Paid service"
+    assert "insurance_expiry" in bike and "next_due_pending" in bike
+    assert database.create_customer("After Upgrade", "9000077777", service_types=["Paid service"])[0]
+
+
+def test_agent_prompts_stay_small(db):
+    """CLAUDE.md: the prompt is re-read every turn, so its size is money. A
+    jump past these budgets needs a decision, not an accident."""
+    import bot
+
+    service = bot.build_system_instruction(db.get_customer(1))
+    customer = db.get_customer(1)
+    customer["call_purpose"] = "insurance"
+    insurance = bot.build_system_instruction(customer)
+    assert len(service) < 7500, len(service)
+    assert len(insurance) < 6000, len(insurance)
+
+
+def test_repo_holds_no_secrets_or_customer_data():
+    """The repository is public: no env files, databases or client workbooks."""
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        tracked = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True).stdout.split()
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("not a git checkout")
+    bad = [f for f in tracked if f == ".env" or f.endswith((".db", ".xlsx", "-wal", "-shm")) or "application_default_credentials" in f]
+    assert not bad, f"tracked files that must stay private: {bad}"
+    for name in tracked:
+        if name.endswith((".py", ".sh", ".md", ".yml", ".service")):
+            text = open(os.path.join(root, name), errors="ignore").read()
+            assert ("-----BEGIN " + "PRIVATE KEY-----") not in text and ("AI" + "za") not in text, f"looks like a secret in {name}"
+
+
+def test_deploy_scripts_parse():
+    import glob
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    scripts = glob.glob(os.path.join(root, "deploy", "*.sh"))
+    assert scripts
+    for script in scripts:
+        result = subprocess.run(["bash", "-n", script], capture_output=True, text=True)
+        assert result.returncode == 0, f"{script}: {result.stderr}"

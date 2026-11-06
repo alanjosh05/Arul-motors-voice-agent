@@ -1,0 +1,160 @@
+# Backend CI/CD for the Arul Motors voice agent + CRM API.
+#
+#   pull request / push to main  ->  lint, tests (SQLite + MySQL), coverage floor
+#   push to main, all green      ->  deploy to the GCP VM, then verify it is live
+#
+# The deploy signs in to Google Cloud with Workload Identity Federation (a
+# short-lived token; no key is stored in GitHub) and reaches the VM through
+# Google's IAP tunnel. Setup: deploy/gcp-setup-cicd.sh; details: deploy/CICD.md.
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push cancels this ref's older test run; deploys never cancel (below).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install ruff
+      # Syntax errors, undefined names, unused imports: things that crash at runtime.
+      - run: ruff check --select E9,F .
+      # The deploy scripts run as root on the VM.
+      - run: shellcheck --severity=warning deploy/*.sh
+
+  tests:
+    name: Tests (SQLite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      # Production runs on SQLite. The coverage floor keeps new code from landing untested.
+      - run: >
+          python -m pytest -q
+          --cov=api --cov=auth --cov=bot --cov=crm_export --cov=database --cov=job_card_extract
+          --cov-report=term-missing:skip-covered --cov-fail-under=80
+
+  mysql:
+    name: Tests (MySQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root
+          MYSQL_DATABASE: arul_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pci-root"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      TEST_MYSQL_HOST: 127.0.0.1
+      TEST_MYSQL_PORT: "3306"
+      TEST_MYSQL_USER: root
+      TEST_MYSQL_PASSWORD: ci-root
+      TEST_MYSQL_DATABASE: arul_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  deploy:
+    name: Deploy to GCP VM
+    needs: [lint, tests, mysql]
+    # Only a push to main that passed everything above. Pull requests never deploy.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: https://backend.arulmotors.com/api/health
+    # One deploy at a time, and never cancelled half way.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # lets this job ask Google for a short-lived token
+    env:
+      VM: arulmotors
+      ZONE: asia-south1-c
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # The VM is stopped overnight (21:00-07:00 IST); a push at any hour starts it.
+      - name: Start the VM if it is stopped
+        run: |
+          status="$(gcloud compute instances describe "$VM" --zone "$ZONE" --format='value(status)')"
+          echo "VM is $status"
+          if [ "$status" != "RUNNING" ]; then
+            gcloud compute instances start "$VM" --zone "$ZONE"
+          fi
+
+      - name: Wait for SSH through IAP
+        run: |
+          for i in $(seq 1 30); do
+            if gcloud compute ssh "$VM" --zone "$ZONE" --tunnel-through-iap --quiet \
+                 --ssh-key-expire-after=30m --command "true" 2>/dev/null; then
+              echo "SSH is up"; exit 0
+            fi
+            echo "waiting for SSH ($i/30)"; sleep 10
+          done
+          echo "SSH never came up" >&2; exit 1
+
+      - name: Deploy ${{ github.sha }}
+        run: |
+          gcloud compute scp deploy/ci-deploy.sh "$VM:/tmp/ci-deploy-${GITHUB_SHA}.sh" \
+            --zone "$ZONE" --tunnel-through-iap --quiet --ssh-key-expire-after=30m
+          gcloud compute ssh "$VM" --zone "$ZONE" --tunnel-through-iap --quiet --ssh-key-expire-after=30m \
+            --command "sudo bash /tmp/ci-deploy-${GITHUB_SHA}.sh ${GITHUB_SHA}; code=\$?; rm -f /tmp/ci-deploy-${GITHUB_SHA}.sh; exit \$code"
+
+      # What the world sees, not what the VM says about itself.
+      - name: Verify the live API runs this commit
+        run: |
+          want="${GITHUB_SHA:0:12}"
+          for i in $(seq 1 20); do
+            got="$(curl -fsS -m 10 https://backend.arulmotors.com/api/health | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' || true)"
+            if [ "$got" = "$want" ]; then echo "live: $got"; exit 0; fi
+            echo "live version is '${got}', want $want ($i/20)"; sleep 6
+          done
+          echo "the live API did not report $want" >&2; exit 1

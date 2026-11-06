@@ -332,11 +332,22 @@ def login(body: LoginIn, request: Request):
     return {"token": auth.create_token(user), "user": user}
 
 
+# The commit this server was deployed from: deploy/ci-deploy.sh writes it next
+# to the code, and the pipeline checks it after each deploy ("dev" locally).
+_VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".deployed-sha")
+DEPLOYED_VERSION = open(_VERSION_FILE).read().strip()[:12] if os.path.exists(_VERSION_FILE) else "dev"
+
+
 @app.get("/api/health")
 def health():
     """Public: up/down, the showroom clock and working hours (the CRM uses the
     server's clock for shift hours, not the device's)."""
-    return {"status": "ok", "time": database.now().isoformat(timespec="seconds"), "shift": database.shift_info()}
+    return {
+        "status": "ok",
+        "time": database.now().isoformat(timespec="seconds"),
+        "shift": database.shift_info(),
+        "version": DEPLOYED_VERSION,
+    }
 
 
 @app.websocket("/api/ws")
