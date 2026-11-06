@@ -602,7 +602,7 @@ def test_voice_relay_checks_customer_and_forwards(db, monkeypatch):
     assert client.post("/api/voice/offer", json=offer).json()["pc_id"] == "pc1"
     assert sent[0] == (
         "POST",
-        {"sdp": "offer", "type": "offer", "request_data": {"customer_id": 2, "started_by": "Test staff"}},
+        {"sdp": "offer", "type": "offer", "request_data": {"customer_id": 2, "purpose": "service", "started_by": "Test staff"}},
     )
     assert client.post("/api/voice/offer", json={"sdp": "o", "type": "offer"}).status_code == 400
     assert client.post("/api/voice/offer", json={**offer, "requestData": {"customer_id": 999}}).status_code == 404
@@ -1772,3 +1772,32 @@ def test_bike_insurance(db):
     assert not database.update_vehicle(bike["id"], insurance_expiry="nonsense")[0]
     assert database.update_vehicle(bike["id"], insurance_expiry="")[0]
     assert mine()["insurance_expiry"] is None
+
+
+def test_agent_prompt_mentions_expiring_insurance(db):
+    import bot
+
+    cid = 1
+    vehicle = db.get_customer(cid)["vehicles"][0]
+    assert "INSURANCE:" not in bot.build_system_instruction(db.get_customer(cid))  # none added
+    soon = days_ahead(10)
+    assert db.update_vehicle(vehicle["id"], insurance_expiry=soon)[0]
+    prompt = bot.build_system_instruction(db.get_customer(cid))
+    assert "INSURANCE:" in prompt and vehicle["registration_number"] in prompt.split("INSURANCE:")[1].split("SERVICE INFO")[0]
+    assert db.update_vehicle(vehicle["id"], insurance_expiry=days_ahead(200))[0]
+    assert "INSURANCE:" not in bot.build_system_instruction(db.get_customer(cid))  # far off: no reminder
+    assert db.update_vehicle(vehicle["id"], insurance_expiry=days_ahead(-5))[0]
+    assert "expired on" in bot.build_system_instruction(db.get_customer(cid))
+
+
+def test_insurance_call_prompt(db):
+    import bot
+
+    customer = db.get_customer(1)
+    vehicle = customer["vehicles"][0]
+    db.update_vehicle(vehicle["id"], insurance_expiry=days_ahead(5))
+    customer = db.get_customer(1)
+    customer["call_purpose"] = "insurance"
+    prompt = bot.build_system_instruction(customer)
+    assert "INSURANCE is expiring" in prompt and "insurance expires on" in prompt
+    assert db.log_call(1, "insurance_reminded")[0] and db.log_call(1, "insurance_renewed")[0]

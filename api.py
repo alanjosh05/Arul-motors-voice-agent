@@ -1037,7 +1037,12 @@ async def voice_offer(request: Request, user: dict = Depends(current_user)):
         raise HTTPException(status_code=400, detail="customer_id is required.") from None
     if not await asyncio.to_thread(database.get_customer, customer_id):
         raise HTTPException(status_code=404, detail="Customer not found.")
-    payload["request_data"] = {"customer_id": customer_id, "started_by": user.get("full_name") or user["username"]}
+    purpose = "insurance" if request_data.get("purpose") == "insurance" else "service"
+    payload["request_data"] = {
+        "customer_id": customer_id,
+        "purpose": purpose,
+        "started_by": user.get("full_name") or user["username"],
+    }
     return await _relay_to_bot("POST", payload)
 
 

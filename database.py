@@ -43,6 +43,9 @@ CLOSED_WEEKDAYS: set[int] = {6}
 MAX_DAYS_AHEAD = 30
 
 # Yamaha service schedule, in order (used to label a bike's previous service).
+# The CRM and the agent remind about a bike's insurance this many days before it expires.
+INSURANCE_REMIND_DAYS = 30
+
 SERVICE_SEQUENCE = [
     "First free service",
     "Second free service",
@@ -71,6 +74,9 @@ CALL_OUTCOMES = {
     "bike_sold",
     "wrong_number",
     "no_answer",
+    # Insurance reminder calls:
+    "insurance_renewed",  # says it is already renewed
+    "insurance_reminded",  # reminded; will renew
 }
 
 
@@ -3253,6 +3259,7 @@ OUTCOME_NOTIFICATIONS = {
     "bike_sold": ("info", "Bike sold"),
     "wrong_number": ("warning", "Wrong number"),
     "no_answer": ("warning", "No answer"),
+    "insurance_renewed": ("info", "Insurance already renewed"),
 }
 
 
