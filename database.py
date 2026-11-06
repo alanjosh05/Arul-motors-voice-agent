@@ -467,6 +467,16 @@ def init_db():
                 (name, description, (cursor.fetchone()["n"] or 0) + 1),
             )
 
+    # Which scheduled services apply to a customer (checked when the customer is
+    # added). No rows = not set yet (older customers): every service applies.
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS customer_services (
+        customer_id INTEGER NOT NULL,
+        service_type_id INTEGER NOT NULL,
+        PRIMARY KEY (customer_id, service_type_id)
+    ) {t['table']}
+    """)
+
     # Change feed for the CRM's live updates. Both the voice agent and the API
     # append events here; the API streams new rows to browsers over WebSocket.
     cursor.execute(f"""
@@ -536,6 +546,11 @@ def init_db():
     # PENDING_OIL (1) the oil wasn't changed, the oil-change visit sets it;
     # PENDING_FIRST_VISIT (2) bought elsewhere, its first visit here sets it.
     _ensure_column(cursor, "vehicles", "next_due_pending", "INTEGER DEFAULT 0")
+    # Insurance policy: who insures the bike, the policy number and when it expires
+    # (the CRM's Insurance page reminds before the expiry).
+    _ensure_column(cursor, "vehicles", "insurance_provider", t["str"])
+    _ensure_column(cursor, "vehicles", "insurance_policy_no", t["str"])
+    _ensure_column(cursor, "vehicles", "insurance_expiry", "DATE NULL" if using_mysql() else "TEXT")
     # How a record changed the bike's schedule: set (default) / pending (next
     # service after the oil change) / keep (a repair: schedule unchanged).
     _ensure_column(cursor, "service_records", "schedule", t["str"])
@@ -758,6 +773,48 @@ def _spoken(day: str) -> str:
 # ---------------------------------------------------------------------------
 # Customers & bikes
 # ---------------------------------------------------------------------------
+def customer_service_names(cursor, customer_id: int) -> list[str]:
+    """Names of the services checked for this customer, in schedule order
+    ([] = none set: every service applies)."""
+    cursor.execute(
+        "SELECT t.name FROM customer_services cs JOIN service_types t ON t.id = cs.service_type_id "
+        "WHERE cs.customer_id = ? ORDER BY t.sort_order, t.id",
+        (customer_id,),
+    )
+    return [row["name"] for row in cursor.fetchall()]
+
+
+def _set_customer_services(cursor, customer_id: int, names: list[str] | None) -> str | None:
+    """Replace the customer's checked services with `names`. Returns an error
+    message, or None. Repairs can't be checked (they never lead to a follow-up)."""
+    if names is None:
+        return None
+    wanted = list(dict.fromkeys(n.strip() for n in names if n and n.strip()))
+    cursor.execute("SELECT id, name, is_repair FROM service_types")
+    types = {row["name"].lower(): row for row in cursor.fetchall()}
+    ids = []
+    for name in wanted:
+        row = types.get(name.lower())
+        if not row:
+            return f"Unknown service: {name}."
+        if row["is_repair"]:
+            return f"{row['name']} is a repair, so it can't be a following service."
+        ids.append(row["id"])
+    cursor.execute("DELETE FROM customer_services WHERE customer_id = ?", (customer_id,))
+    for type_id in ids:
+        cursor.execute("INSERT INTO customer_services (customer_id, service_type_id) VALUES (?, ?)", (customer_id, type_id))
+    return None
+
+
+def _check_next_allowed(cursor, customer_id: int, next_type: str | None) -> None:
+    """A bike's next service must be one of the customer's checked services."""
+    if not next_type:
+        return
+    allowed = customer_service_names(cursor, customer_id)
+    if allowed and next_type.lower() not in {n.lower() for n in allowed}:
+        raise ValueError(f"{next_type} isn't one of this customer's services ({', '.join(allowed)}).")
+
+
 def get_customer(customer_id: int) -> dict | None:
     """Return a customer with their bikes (and any upcoming appointments)."""
     conn = _connect()
@@ -773,6 +830,7 @@ def get_customer(customer_id: int) -> dict | None:
         (customer_id,),
     )
     customer["vehicles"] = [_plain(v) for v in cursor.fetchall()]
+    customer["service_types"] = customer_service_names(cursor, customer_id)
     cursor.execute(
         "SELECT * FROM service_appointments WHERE customer_id = ? AND status = 'CONFIRMED' ORDER BY appointment_date",
         (customer_id,),
@@ -827,7 +885,18 @@ def get_due_services(within_days: int = 7) -> list:
     )
     rows = [_plain(r) for r in cursor.fetchall()]
     grace = _overdue_days_by_type(cursor)
+    # Only the services checked for the customer are followed up.
+    cursor.execute(
+        "SELECT cs.customer_id, t.name FROM customer_services cs JOIN service_types t ON t.id = cs.service_type_id"
+    )
+    checked: dict[int, set[str]] = {}
+    for r in cursor.fetchall():
+        checked.setdefault(r["customer_id"], set()).add(r["name"].lower())
     conn.close()
+    rows = [
+        r for r in rows
+        if r["customer_id"] not in checked or (r["next_service_type"] or "").lower() in checked[r["customer_id"]]
+    ]
     for row in rows:
         row.update(_overdue_info(row["next_service_date"], grace.get(row["next_service_type"], 0)))
     return rows
@@ -864,6 +933,10 @@ def add_customer_vehicle(
     alternate_mobile: str | None = None,
     bought_elsewhere: bool = False,
     dealer_name: str | None = None,
+    service_types: list[str] | None = None,
+    insurance_provider: str | None = None,
+    insurance_policy_no: str | None = None,
+    insurance_expiry: str | None = None,
 ) -> tuple[bool, str]:
     """Add a bike (creating the customer, with `alternate_mobile`, if the
     mobile number is new): one sold here, or one `bought_elsewhere` (from
@@ -883,6 +956,9 @@ def add_customer_vehicle(
     alternate_mobile, error = _check_alternate(alternate_mobile, mobile_number)
     if error:
         return (False, error)
+    insurance_day = normalize_date(insurance_expiry) if insurance_expiry else None
+    if insurance_expiry and not insurance_day:
+        return (False, "Invalid insurance expiry date.")
 
     conn = _connect()
     cursor = conn.cursor()
@@ -902,12 +978,23 @@ def add_customer_vehicle(
             (name, mobile_number, alternate_mobile),
         )
         customer_id = cursor.lastrowid
+    error = _set_customer_services(cursor, customer_id, service_types)
+    if not error and next_service_type:
+        try:
+            _check_next_allowed(cursor, customer_id, next_service_type)
+        except ValueError as e:
+            error = str(e)
+    if error:
+        conn.rollback()
+        conn.close()
+        return (False, error)
 
     cursor.execute(
         """
     INSERT INTO vehicles (customer_id, registration_number, model, purchase_date, last_service_date, odometer_km,
-                          next_service_date, next_service_type, bought_elsewhere, dealer_name, next_due_pending, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                          next_service_date, next_service_type, bought_elsewhere, dealer_name, next_due_pending, created_at,
+                          insurance_provider, insurance_policy_no, insurance_expiry)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
     """,
         (
             customer_id,
@@ -922,6 +1009,9 @@ def add_customer_vehicle(
             1 if bought_elsewhere else 0,
             (dealer_name or "").strip() or None if bought_elsewhere else None,
             PENDING_FIRST_VISIT if unknown_next else 0,
+            (insurance_provider or "").strip() or None,
+            (insurance_policy_no or "").strip() or None,
+            insurance_day,
         ),
     )
     conn.commit()
@@ -1412,7 +1502,7 @@ def _repair_types(cursor) -> set[str]:
     return {row["name"].lower() for row in cursor.fetchall()}
 
 
-def _apply_repair_rule(cursor, rec: dict) -> None:
+def _apply_repair_rule(cursor, rec: dict, customer_id: int | None = None) -> None:
     """A visit under a repair type (e.g. Accident repair) keeps the schedule:
     no next service, so no follow-up. A repair type is never a next service."""
     repairs = _repair_types(cursor)
@@ -1420,6 +1510,8 @@ def _apply_repair_rule(cursor, rec: dict) -> None:
         rec.update(schedule="keep", next_service_date=None, next_service_type=None)
     elif (rec["next_service_type"] or "").lower() in repairs:
         raise ValueError(f"{rec['next_service_type']} is a repair, so it can't be the next service.")
+    if customer_id is not None:
+        _check_next_allowed(cursor, customer_id, rec["next_service_type"])
 
 
 def _move_bike_on(cursor, vehicle_id: int, record_id: int, rec: dict) -> None:
@@ -1494,7 +1586,7 @@ def close_service(appointment_id: str, details: dict, pdf: bytes | None, pdf_nam
         return (False, f"No open booking with ID {appointment_id}.", None)
     rec["service_type"] = rec["service_type"] or booking["service_type"]
     try:
-        _apply_repair_rule(cursor, rec)
+        _apply_repair_rule(cursor, rec, booking["customer_id"])
     except ValueError as e:
         conn.close()
         return (False, str(e), None)
@@ -1557,7 +1649,7 @@ def record_walk_in_service(vehicle_id: int, details: dict, pdf: bytes | None, pd
         conn.close()
         return (False, f"This bike has booking {booking['id']}. Close that booking with the job card instead.", None)
     try:
-        _apply_repair_rule(cursor, rec)
+        _apply_repair_rule(cursor, rec, vehicle["customer_id"])
     except ValueError as e:
         conn.close()
         return (False, str(e), None)
@@ -1608,7 +1700,7 @@ def update_service_record(record_id: int, details: dict, pdf: bytes | None = Non
         return (False, "Service record not found.")
     rec["service_type"] = rec["service_type"] or current["service_type"]
     try:
-        _apply_repair_rule(cursor, rec)
+        _apply_repair_rule(cursor, rec, current["customer_id"])
     except ValueError as e:
         conn.close()
         return (False, str(e))
@@ -2037,6 +2129,13 @@ def list_customers(query: str | None = None) -> list:
         "SELECT * FROM call_logs WHERE id IN (SELECT max(id) FROM call_logs GROUP BY customer_id)"
     )
     last_calls = {r["customer_id"]: r for r in (_plain(row) for row in cursor.fetchall())}
+    cursor.execute(
+        "SELECT cs.customer_id, t.name FROM customer_services cs JOIN service_types t ON t.id = cs.service_type_id "
+        "ORDER BY t.sort_order, t.id"
+    )
+    checked: dict[int, list[str]] = {}
+    for r in cursor.fetchall():
+        checked.setdefault(r["customer_id"], []).append(r["name"])
     conn.close()
 
     bikes_by_customer: dict[int, list] = {}
@@ -2052,6 +2151,7 @@ def list_customers(query: str | None = None) -> list:
         customer["vehicles"] = bikes_by_customer.get(cid, [])
         customer["next_appointment"] = next_booking.get(cid)
         customer["last_call"] = last_calls.get(cid)
+        customer["service_types"] = checked.get(cid, [])
         if query:
             haystack = " ".join(
                 [customer["name"], customer["mobile_number"], customer.get("alternate_mobile") or ""]
@@ -2098,7 +2198,7 @@ def _check_alternate(alternate: str | None, main: str) -> tuple[str | None, str 
 
 
 def create_customer(
-    name: str, mobile_number: str, alternate_mobile: str | None = None
+    name: str, mobile_number: str, alternate_mobile: str | None = None, service_types: list[str] | None = None
 ) -> tuple[bool, str, int | None]:
     name, mobile_number = (name or "").strip(), _clean_mobile(mobile_number)
     if not name or len(_digits(mobile_number)) < 10:
@@ -2117,6 +2217,11 @@ def create_customer(
         (name, mobile_number, alternate_mobile),
     )
     customer_id = cursor.lastrowid
+    error = _set_customer_services(cursor, customer_id, service_types)
+    if error:
+        conn.rollback()
+        conn.close()
+        return (False, error, None)
     conn.commit()
     conn.close()
     _record_change(["customers", "stats"], customer_id)
@@ -2128,6 +2233,7 @@ def update_customer(
     name: str | None = None,
     mobile_number: str | None = None,
     alternate_mobile: str | None = None,
+    service_types: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Edit a customer. alternate_mobile="" removes the second number; sending
     both numbers swapped makes the alternate the main (called) number."""
@@ -2162,6 +2268,14 @@ def update_customer(
         cursor.execute("UPDATE customers SET mobile_number = ? WHERE id = ?", (mobile_number, customer_id))
     if set_alternate:
         cursor.execute("UPDATE customers SET alternate_mobile = ? WHERE id = ?", (alternate_mobile, customer_id))
+    if service_types is not None:
+        # A bike already waiting on a service that was unchecked is left as it is
+        # (it just isn't called); it moves on at its next visit.
+        error = _set_customer_services(cursor, customer_id, service_types)
+        if error:
+            conn.rollback()
+            conn.close()
+            return (False, error)
     conn.commit()
     conn.close()
     _record_change(CUSTOMER_ENTITIES, customer_id)
@@ -2178,7 +2292,7 @@ def delete_customer(customer_id: int) -> tuple[bool, str]:
         "DELETE FROM service_documents WHERE record_id IN (SELECT id FROM service_records WHERE customer_id = ?)",
         (customer_id,),
     )
-    for table in ("service_records", "call_logs", "service_appointments", "vehicles"):
+    for table in ("service_records", "call_logs", "service_appointments", "vehicles", "customer_services"):
         cursor.execute(f"DELETE FROM {table} WHERE customer_id = ?", (customer_id,))
     cursor.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
     conn.commit()
@@ -2203,10 +2317,10 @@ def list_vehicles() -> list:
 VEHICLE_FIELDS = (
     "registration_number", "model", "purchase_date", "last_service_date",
     "odometer_km", "next_service_date", "next_service_type", "frame_number", "engine_number",
-    "bought_elsewhere", "dealer_name",
+    "bought_elsewhere", "dealer_name", "insurance_provider", "insurance_policy_no", "insurance_expiry",
 )
 # Sent as "" to clear them (e.g. purchase date not known).
-CLEARABLE_VEHICLE_FIELDS = ("purchase_date", "dealer_name")
+CLEARABLE_VEHICLE_FIELDS = ("purchase_date", "dealer_name", "insurance_provider", "insurance_policy_no", "insurance_expiry")
 
 
 def update_vehicle(vehicle_id: int, **changes) -> tuple[bool, str]:
@@ -2222,7 +2336,7 @@ def update_vehicle(vehicle_id: int, **changes) -> tuple[bool, str]:
         changes["dealer_name"] = changes["dealer_name"].strip()
     if not changes:
         return (False, "Nothing to change.")
-    for key in ("purchase_date", "last_service_date", "next_service_date"):
+    for key in ("purchase_date", "last_service_date", "next_service_date", "insurance_expiry"):
         if key in changes and changes[key] is not None:
             day = normalize_date(str(changes[key]))
             if not day:
@@ -3003,6 +3117,7 @@ def delete_service_type(type_id: int) -> tuple[bool, str]:
         )
     conn = _connect()
     cursor = conn.cursor()
+    cursor.execute("DELETE FROM customer_services WHERE service_type_id = ?", (type_id,))
     cursor.execute("DELETE FROM service_types WHERE id = ?", (type_id,))
     conn.commit()
     conn.close()

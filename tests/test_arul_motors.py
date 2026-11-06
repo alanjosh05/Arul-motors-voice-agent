@@ -1741,3 +1741,34 @@ def test_bike_from_another_dealer_needs_no_next_service(db, monkeypatch):
                        files={"report": ("a.pdf", PDF, "application/pdf")}).status_code == 201
     bike = next(v for v in client.get("/api/vehicles").json() if v["id"] == bike["id"])
     assert (bike["next_due_pending"], bike["next_service_type"], bike["next_service_date"]) == (0, "Third free service", days_ahead(90))
+
+
+def test_customer_services_limit_followups(db):
+    database = db
+    ok, _, cid = database.create_customer("Svc Test", "9000011111", service_types=["First free service", "Paid service"])
+    assert ok
+    assert database.get_customer(cid)["service_types"] == ["First free service", "Paid service"]
+    ok, msg = database.add_customer_vehicle("Svc Test", "9000011111", "TN69ZZ0001", "FZ", "2020-01-01", "Second free service")
+    assert not ok and "isn't one of" in msg
+    ok, _ = database.add_customer_vehicle("Svc Test", "9000011111", "TN69ZZ0001", "FZ", "2020-01-01", "Paid service")
+    assert ok
+    assert any(d["customer_id"] == cid for d in database.get_due_services(within_days=100000))
+    assert not database.create_customer("Bad", "9000022222", service_types=["Accident repair"])[0]
+
+
+def test_bike_insurance(db):
+    database = db
+    ok, _ = database.add_customer_vehicle("Ins Test", "9000033333", "TN69IN0001", "FZ", "2030-01-01", "Paid service",
+                                          insurance_provider="New India", insurance_policy_no="P123", insurance_expiry="2031-02-03")
+    assert ok
+
+    def mine():
+        return next(v for v in database.list_vehicles() if v["registration_number"] == "TN69IN0001")
+
+    bike = mine()
+    assert (bike["insurance_provider"], bike["insurance_expiry"]) == ("New India", "2031-02-03")
+    assert database.update_vehicle(bike["id"], insurance_expiry="2032-01-01")[0]
+    assert mine()["insurance_expiry"] == "2032-01-01"
+    assert not database.update_vehicle(bike["id"], insurance_expiry="nonsense")[0]
+    assert database.update_vehicle(bike["id"], insurance_expiry="")[0]
+    assert mine()["insurance_expiry"] is None

@@ -418,12 +418,14 @@ class CustomerIn(BaseModel):
     name: str
     mobile_number: str
     alternate_mobile: str | None = None
+    service_types: list[str] | None = None  # the services that apply (checked)
 
 
 class CustomerPatch(BaseModel):
     name: str | None = None
     mobile_number: str | None = None
     alternate_mobile: str | None = None  # "" removes it; swap both to change the called number
+    service_types: list[str] | None = None  # replaces the checked services
 
 
 @api.get("/customers")
@@ -437,7 +439,7 @@ def get_customers(q: str | None = None):
 
 @api.post("/customers", status_code=201)
 def create_customer(body: CustomerIn):
-    return _check(database.create_customer(body.name, body.mobile_number, body.alternate_mobile))
+    return _check(database.create_customer(body.name, body.mobile_number, body.alternate_mobile, body.service_types))
 
 
 @api.get("/customers/{customer_id}")
@@ -450,7 +452,7 @@ def get_customer(customer_id: int):
 
 @api.patch("/customers/{customer_id}")
 def update_customer(customer_id: int, body: CustomerPatch):
-    return _check(database.update_customer(customer_id, body.name, body.mobile_number, body.alternate_mobile))
+    return _check(database.update_customer(customer_id, body.name, body.mobile_number, body.alternate_mobile, body.service_types))
 
 
 @api.delete("/customers/{customer_id}")
@@ -474,6 +476,10 @@ class VehicleIn(BaseModel):
     alternate_mobile: str | None = None  # used only when this creates the customer
     bought_elsewhere: bool = False  # bought from another dealer, serviced here
     dealer_name: str | None = None
+    service_types: list[str] | None = None  # services that apply, when this creates the customer
+    insurance_provider: str | None = None
+    insurance_policy_no: str | None = None
+    insurance_expiry: str | None = None
 
 
 class VehiclePatch(BaseModel):
@@ -488,6 +494,9 @@ class VehiclePatch(BaseModel):
     engine_number: str | None = None
     bought_elsewhere: bool | None = None
     dealer_name: str | None = None  # "" clears it (as does "" for purchase_date)
+    insurance_provider: str | None = None  # "" clears the insurance fields
+    insurance_policy_no: str | None = None
+    insurance_expiry: str | None = None
 
 
 @api.get("/vehicles")
