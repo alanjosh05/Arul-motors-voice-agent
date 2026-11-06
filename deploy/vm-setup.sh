@@ -17,7 +17,7 @@ SRC="$(cd "$(dirname "$0")/.." && pwd)"
 APP=/opt/arul-motors
 
 apt-get update -q
-apt-get install -y -q python3-venv python3-dev build-essential sqlite3 curl \
+apt-get install -y -q python3-venv python3-dev build-essential sqlite3 curl psmisc \
   debian-keyring debian-archive-keyring apt-transport-https
 
 # Caddy (HTTPS reverse proxy), from its official apt repository.
