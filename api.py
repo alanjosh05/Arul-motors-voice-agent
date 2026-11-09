@@ -113,7 +113,7 @@ async def lifespan(_app: FastAPI):
         await task
 
 
-app = FastAPI(title="Arul Motors Yamaha (Nazareth, Thoothukudi) CRM API", lifespan=lifespan)
+app = FastAPI(title="Arul Motors Yamaha (Nazareth, Thoothukudi) ERP API", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -1034,7 +1034,7 @@ def export_excel():
     return _download(
         crm_export.build_workbook(),
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        f"arul-motors-crm-{database.today().isoformat()}.xlsx",
+        f"arul-motors-erp-{database.today().isoformat()}.xlsx",
     )
 
 
@@ -1289,9 +1289,9 @@ app.include_router(api)
 # Command line
 # ---------------------------------------------------------------------------
 def _create_user_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="python api.py create-user", description="Create a CRM login")
+    parser = argparse.ArgumentParser(prog="python api.py create-user", description="Create an ERP login")
     parser.add_argument("username")
-    parser.add_argument("--name", default=None, help="Full name shown in the CRM")
+    parser.add_argument("--name", default=None, help="Full name shown in the ERP")
     parser.add_argument("--role", default="staff", choices=sorted(database.STAFF_ROLES))
     args = parser.parse_args(argv)
     password = getpass.getpass("Password: ")

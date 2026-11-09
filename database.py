@@ -113,7 +113,7 @@ def shift_info(at: datetime | None = None) -> dict:
     }
 
 
-OUT_OF_SHIFT = "Out of shift hours: the CRM is open {start} – {end}. Only admins can use it now."
+OUT_OF_SHIFT = "Out of shift hours: the ERP is open {start} – {end}. Only admins can use it now."
 
 
 def now() -> datetime:
@@ -3596,7 +3596,7 @@ def backup_bytes() -> bytes:
     """A consistent copy of the SQLite database (safe while the bot and API
     write: SQLite's online backup). For MySQL, use the host's own backups."""
     if using_mysql():
-        raise RuntimeError("Database backups from the CRM are for SQLite only.")
+        raise RuntimeError("Database backups from the ERP are for SQLite only.")
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
