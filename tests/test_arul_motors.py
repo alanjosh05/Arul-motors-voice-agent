@@ -1339,6 +1339,16 @@ def test_parts_usage_adds_up_parts_across_job_cards(db, monkeypatch):
     assert (oil["qty"], oil["services"], oil["amount"], oil["part_nos"]) == (3, 2, 2100, ["90793-AD411"])
     assert (shoe["qty"], shoe["paid_qty"], shoe["warranty_qty"], shoe["amount"]) == (2, 0, 2, 0)
     assert len(oil["uses"]) == 2 and oil["last_used"] == days_ahead(-5)
+    # Every use: which bike, whose, when, which job card, and its PDF opens.
+    newest, oldest = oil["uses"]
+    bike = karthik["vehicles"][0]
+    assert (newest["date"], newest["job_card_no"], newest["qty"], newest["amount"]) == (days_ahead(-5), "5", 1, 700)
+    assert (oldest["date"], oldest["part_no"], oldest["qty"]) == (days_ahead(-40), "90793-AD411", 2)
+    assert (newest["vehicle_id"], newest["registration_number"], newest["model"]) == (bike["id"], bike["registration_number"], bike["model"])
+    assert (newest["customer_id"], newest["customer_name"], newest["service_type"]) == (karthik["id"], karthik["name"], "Paid service")
+    assert newest["has_report"] is True and shoe["uses"][0]["warranty"] is True
+    report = client.get(f"/api/service-records/{newest['record_id']}/report")
+    assert report.status_code == 200 and report.content == PDF
     assert data["totals"] == {"kinds": 2, "qty": 5, "amount": 2100, "services": 2}
 
     recent = client.get("/api/parts-usage", params={"start": days_ahead(-10)}).json()

@@ -1875,7 +1875,9 @@ def parts_usage(start: str | None = None, end: str | None = None) -> dict:
     added up by part name (case and spacing ignored), most used first.
 
     {"parts": [{name, part_nos, qty, paid_qty, warranty_qty, services, amount,
-    last_used, uses: [{date, job_card_no, registration_number, model, qty, warranty}]}],
+    last_used, uses: [every use, newest first: {record_id, date, service_type, job_card_no,
+    has_report, vehicle_id, registration_number, model, customer_id, customer_name, part_no,
+    qty, amount (₹ per unit), warranty}]}],
     "totals": {...}}. `start`/`end` (YYYY-MM-DD, inclusive) limit by service date."""
     where, params = [], []
     if start:
@@ -1888,8 +1890,13 @@ def parts_usage(start: str | None = None, end: str | None = None) -> dict:
     cursor = conn.cursor()
     cursor.execute(
         f"""
-    SELECT r.id, r.service_date, r.job_card_no, r.parts, v.registration_number, v.model
-    FROM service_records r JOIN vehicles v ON v.id = r.vehicle_id
+    SELECT r.id, r.service_date, r.service_type, r.job_card_no, r.parts, r.vehicle_id, r.customer_id,
+           v.registration_number, v.model, c.name AS customer_name,
+           CASE WHEN d.record_id IS NULL THEN 0 ELSE 1 END AS has_report
+    FROM service_records r
+    JOIN vehicles v ON v.id = r.vehicle_id
+    JOIN customers c ON c.id = r.customer_id
+    LEFT JOIN service_documents d ON d.record_id = r.id
     {'WHERE ' + ' AND '.join(where) if where else ''}
     ORDER BY r.service_date DESC, r.id DESC
     """,
@@ -1927,12 +1934,13 @@ def parts_usage(start: str | None = None, end: str | None = None) -> dict:
             part_no = (p.get("part_no") or "").strip()
             if part_no and part_no not in g["part_nos"]:
                 g["part_nos"].append(part_no)
-            if len(g["uses"]) < 50:
-                g["uses"].append({
-                    "date": row["service_date"], "job_card_no": row["job_card_no"],
-                    "registration_number": row["registration_number"], "model": row["model"],
-                    "qty": qty, "warranty": warranty,
-                })
+            g["uses"].append({
+                "record_id": row["id"], "date": row["service_date"], "service_type": row["service_type"],
+                "job_card_no": row["job_card_no"], "has_report": bool(row["has_report"]),
+                "vehicle_id": row["vehicle_id"], "registration_number": row["registration_number"],
+                "model": row["model"], "customer_id": row["customer_id"], "customer_name": row["customer_name"],
+                "part_no": part_no or None, "qty": qty, "amount": int(p.get("amount") or 0), "warranty": warranty,
+            })
     result = []
     for g in groups.values():
         g["services"] = len(g.pop("_services"))
