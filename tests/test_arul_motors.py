@@ -745,6 +745,10 @@ def test_api_caching_etag_gzip_throttle_and_limits(db, monkeypatch):
     client.post("/api/customers", json={"name": "Vel Murugan", "mobile_number": "9000000001"})
     fresh = client.get("/api/customers", headers={"If-None-Match": etag})
     assert fresh.status_code == 200 and len(fresh.json()) == 5  # versioned cache refreshed too
+    # A new deploy (API restart) with the same data: the browser's copy came from
+    # the old code, so it must get a full response, not a 304.
+    monkeypatch.setattr(api, "BOOT_ID", "newdeploy")
+    assert client.get("/api/customers", headers={"If-None-Match": fresh.headers["etag"]}).status_code == 200
     # No 304 without valid credentials (the route still answers 401).
     from fastapi.testclient import TestClient
     assert TestClient(api.app).get("/api/customers", headers={"If-None-Match": fresh.headers["etag"]}).status_code == 401

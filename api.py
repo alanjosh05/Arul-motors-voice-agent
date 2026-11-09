@@ -121,6 +121,9 @@ app = FastAPI(title="Arul Motors Yamaha (Nazareth, Thoothukudi) CRM API", lifesp
 # date) changes exactly when any CRM data can have changed. The date is part of
 # it because "today", "missed" and "due" depend on it.
 # ---------------------------------------------------------------------------
+BOOT_ID = secrets.token_hex(4)  # new on every API start (each deploy restarts it)
+
+
 def data_version() -> str:
     return f"{database.latest_event_id()}-{database.today().isoformat()}"
 
@@ -180,7 +183,9 @@ async def etag_middleware(request: Request, call_next):
     cacheable = request.method == "GET" and request.url.path.startswith(ETAG_PREFIXES)
     if not cacheable or not _has_valid_credentials(request):
         return await call_next(request)
-    etag = f'W/"{await asyncio.to_thread(data_version)}"'
+    # BOOT_ID: a deploy can change what an endpoint returns without changing
+    # the data; browsers must not keep a cached copy from the old code.
+    etag = f'W/"{BOOT_ID}-{await asyncio.to_thread(data_version)}"'
     headers = {"ETag": etag, "Cache-Control": "private, no-cache", "Vary": "Authorization"}
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
