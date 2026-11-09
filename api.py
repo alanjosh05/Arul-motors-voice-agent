@@ -160,7 +160,7 @@ cache = VersionedCache()
 # they can answer 304 Not Modified when nothing changed.
 ETAG_PREFIXES = (
     "/api/stats", "/api/customers", "/api/vehicles", "/api/due-services", "/api/appointments",
-    "/api/calls", "/api/service-types", "/api/notifications",
+    "/api/calls", "/api/service-types", "/api/notifications", "/api/parts-usage",
 )
 
 
@@ -829,6 +829,13 @@ def extract_job_card(report: UploadFile = File(..., description="Scanned job car
 def service_history(vehicle_id: int):
     """A bike's maintenance records (and older completed services), newest first."""
     return database.get_service_history(vehicle_id)
+
+
+@api.get("/parts-usage")
+def parts_usage(start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"), end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$")):
+    """Parts used across the closed services' job cards, added up by part,
+    optionally between two service dates (inclusive)."""
+    return database.parts_usage(start, end)
 
 
 @api.get("/service-records/{record_id}/report")

@@ -1312,6 +1312,40 @@ def test_admin_deletes_calls_one_or_all(db, monkeypatch):
     assert admin.get("/api/calls/count").json()["total"] == 0
 
 
+def test_parts_usage_adds_up_parts_across_job_cards(db, monkeypatch):
+    """The parts page: the same part on several job cards is added up (case and
+    spacing ignored), warranty parts are counted but not charged, and the date
+    range limits it."""
+    import json
+
+    client = _api_client(monkeypatch, admin=False)
+    assert client.get("/api/parts-usage").json()["parts"] == []
+    karthik = db.get_customer_by_mobile("9876543210")
+    pdf = {"report": ("c.pdf", PDF, "application/pdf")}
+
+    def close(days_ago, parts):
+        aid = client.post("/api/appointments", json={"customer_id": karthik["id"], "appointment_date": days_ahead(1)}).json()["id"]
+        day = days_ahead(-days_ago)
+        form = {"service_date": day, "service_type": "Paid service", "job_card_no": str(days_ago),
+                "parts": json.dumps(parts), "jobs_done": "[]", "labour": "[]"}
+        assert client.post(f"/api/appointments/{aid}/close", data=form, files=pdf).status_code == 201
+
+    close(40, [{"name": "Engine oil", "part_no": "90793-AD411", "qty": 2, "amount": 700}])
+    close(5, [{"name": "engine  OIL", "qty": 1, "amount": 700},
+              {"name": "Brake shoe", "qty": 2, "amount": 300, "warranty": True}])
+
+    data = client.get("/api/parts-usage").json()
+    oil, shoe = data["parts"]  # most used first
+    assert (oil["qty"], oil["services"], oil["amount"], oil["part_nos"]) == (3, 2, 2100, ["90793-AD411"])
+    assert (shoe["qty"], shoe["paid_qty"], shoe["warranty_qty"], shoe["amount"]) == (2, 0, 2, 0)
+    assert len(oil["uses"]) == 2 and oil["last_used"] == days_ahead(-5)
+    assert data["totals"] == {"kinds": 2, "qty": 5, "amount": 2100, "services": 2}
+
+    recent = client.get("/api/parts-usage", params={"start": days_ahead(-10)}).json()
+    assert [(p["name"], p["qty"]) for p in recent["parts"]] == [("Brake shoe", 2), ("engine OIL", 1)]
+    assert client.get("/api/parts-usage", params={"start": "yesterday"}).status_code == 422
+
+
 def test_edit_a_closed_service(db, monkeypatch):
     """Edit a service record: fields change, totals are recomputed, a new PDF
     replaces the job card, and the bike follows only its latest record."""

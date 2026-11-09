@@ -1870,6 +1870,85 @@ def list_service_records() -> list:
     return rows
 
 
+def parts_usage(start: str | None = None, end: str | None = None) -> dict:
+    """What the workshop has used: every part on the closed services' job cards,
+    added up by part name (case and spacing ignored), most used first.
+
+    {"parts": [{name, part_nos, qty, paid_qty, warranty_qty, services, amount,
+    last_used, uses: [{date, job_card_no, registration_number, model, qty, warranty}]}],
+    "totals": {...}}. `start`/`end` (YYYY-MM-DD, inclusive) limit by service date."""
+    where, params = [], []
+    if start:
+        where.append("r.service_date >= ?")
+        params.append(start)
+    if end:
+        where.append("r.service_date <= ?")
+        params.append(end)
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+    SELECT r.id, r.service_date, r.job_card_no, r.parts, v.registration_number, v.model
+    FROM service_records r JOIN vehicles v ON v.id = r.vehicle_id
+    {'WHERE ' + ' AND '.join(where) if where else ''}
+    ORDER BY r.service_date DESC, r.id DESC
+    """,
+        params,
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    groups: dict[str, dict] = {}
+    services_with_parts = 0
+    for row in rows:
+        try:
+            parts = json.loads(row["parts"]) if row["parts"] else []
+        except (TypeError, ValueError):
+            parts = []
+        if not parts:
+            continue
+        services_with_parts += 1
+        for p in parts:
+            name = " ".join(str(p.get("name") or "").split())
+            if not name:
+                continue
+            qty = int(p.get("qty") or 1)
+            warranty = bool(p.get("warranty"))
+            g = groups.setdefault(
+                name.lower(),
+                {"name": name, "part_nos": [], "qty": 0, "paid_qty": 0, "warranty_qty": 0,
+                 "_services": set(), "amount": 0, "last_used": row["service_date"], "uses": []},
+            )
+            g["qty"] += qty
+            g["warranty_qty" if warranty else "paid_qty"] += qty
+            g["_services"].add(row["id"])
+            if not warranty:
+                g["amount"] += qty * int(p.get("amount") or 0)
+            part_no = (p.get("part_no") or "").strip()
+            if part_no and part_no not in g["part_nos"]:
+                g["part_nos"].append(part_no)
+            if len(g["uses"]) < 50:
+                g["uses"].append({
+                    "date": row["service_date"], "job_card_no": row["job_card_no"],
+                    "registration_number": row["registration_number"], "model": row["model"],
+                    "qty": qty, "warranty": warranty,
+                })
+    result = []
+    for g in groups.values():
+        g["services"] = len(g.pop("_services"))
+        result.append(g)
+    result.sort(key=lambda g: (-g["qty"], g["name"].lower()))
+    return {
+        "parts": result,
+        "totals": {
+            "kinds": len(result),
+            "qty": sum(g["qty"] for g in result),
+            "amount": sum(g["amount"] for g in result),
+            "services": services_with_parts,
+        },
+    }
+
+
 def get_service_document(record_id: int) -> dict | None:
     """The service report PDF of a record: {filename, content_type, data}."""
     conn = _connect()
