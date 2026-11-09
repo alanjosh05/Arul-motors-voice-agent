@@ -1319,7 +1319,7 @@ def test_admin_deletes_calls_one_or_all(db, monkeypatch):
 def test_parts_usage_adds_up_parts_across_job_cards(db, monkeypatch):
     """The parts page: the same part on several job cards is added up (case and
     spacing ignored), warranty parts are counted but not charged, and the date
-    range limits it."""
+    range limits it. The summary is one row per part; uses come a page at a time."""
     import json
 
     client = _api_client(monkeypatch, admin=False)
@@ -1329,10 +1329,11 @@ def test_parts_usage_adds_up_parts_across_job_cards(db, monkeypatch):
 
     def close(days_ago, parts):
         aid = client.post("/api/appointments", json={"customer_id": karthik["id"], "appointment_date": days_ahead(1)}).json()["id"]
-        day = days_ahead(-days_ago)
-        form = {"service_date": day, "service_type": "Paid service", "job_card_no": str(days_ago),
+        form = {"service_date": days_ahead(-days_ago), "service_type": "Paid service", "job_card_no": str(days_ago),
                 "parts": json.dumps(parts), "jobs_done": "[]", "labour": "[]"}
-        assert client.post(f"/api/appointments/{aid}/close", data=form, files=pdf).status_code == 201
+        r = client.post(f"/api/appointments/{aid}/close", data=form, files=pdf)
+        assert r.status_code == 201, r.text
+        return r.json()["id"], form
 
     close(40, [{"name": "Engine oil", "part_no": "90793-AD411", "qty": 2, "amount": 700}])
     close(5, [{"name": "engine  OIL", "qty": 1, "amount": 700},
@@ -1340,24 +1341,121 @@ def test_parts_usage_adds_up_parts_across_job_cards(db, monkeypatch):
 
     data = client.get("/api/parts-usage").json()
     oil, shoe = data["parts"]  # most used first
-    assert (oil["qty"], oil["services"], oil["amount"], oil["part_nos"]) == (3, 2, 2100, ["90793-AD411"])
+    assert (oil["key"], oil["qty"], oil["services"], oil["amount"], oil["part_nos"]) == ("engine oil", 3, 2, 2100, ["90793-AD411"])
     assert (shoe["qty"], shoe["paid_qty"], shoe["warranty_qty"], shoe["amount"]) == (2, 0, 2, 0)
-    assert len(oil["uses"]) == 2 and oil["last_used"] == days_ahead(-5)
-    # Every use: which bike, whose, when, which job card, and its PDF opens.
-    newest, oldest = oil["uses"]
+    assert oil["last_used"] == days_ahead(-5) and "uses" not in oil  # summary only: stays small
+    assert data["totals"] == {"kinds": 2, "qty": 5, "amount": 2100, "services": 2}
+
+    # Every use of a part: which bike, whose, when, which job card; its PDF opens.
+    uses = client.get("/api/parts-usage/uses", params={"part": "Engine Oil"}).json()
+    assert uses["total"] == 2 and uses["next"] is None
+    newest, oldest = uses["items"]
     bike = karthik["vehicles"][0]
     assert (newest["date"], newest["job_card_no"], newest["qty"], newest["amount"]) == (days_ahead(-5), "5", 1, 700)
     assert (oldest["date"], oldest["part_no"], oldest["qty"]) == (days_ahead(-40), "90793-AD411", 2)
     assert (newest["vehicle_id"], newest["registration_number"], newest["model"]) == (bike["id"], bike["registration_number"], bike["model"])
     assert (newest["customer_id"], newest["customer_name"], newest["service_type"]) == (karthik["id"], karthik["name"], "Paid service")
-    assert newest["has_report"] is True and shoe["uses"][0]["warranty"] is True
+    assert newest["has_report"] is True
     report = client.get(f"/api/service-records/{newest['record_id']}/report")
     assert report.status_code == 200 and report.content == PDF
-    assert data["totals"] == {"kinds": 2, "qty": 5, "amount": 2100, "services": 2}
 
     recent = client.get("/api/parts-usage", params={"start": days_ahead(-10)}).json()
     assert [(p["name"], p["qty"]) for p in recent["parts"]] == [("Brake shoe", 2), ("engine OIL", 1)]
     assert client.get("/api/parts-usage", params={"start": "yesterday"}).status_code == 422
+    assert client.get("/api/parts-usage/uses", params={"after": "nonsense"}).status_code == 400
+
+
+def test_parts_uses_page_search_stay_in_sync_and_merge(db, monkeypatch):
+    """Uses page by keyset (no gaps or repeats), search across part, bike,
+    customer and card no., follow edits and deletes of the service, and merged
+    names count as one part until unmerged."""
+    import json
+
+    staff = _api_client(monkeypatch, admin=False)
+    karthik = db.get_customer_by_mobile("9876543210")
+    pdf = {"report": ("c.pdf", PDF, "application/pdf")}
+    records = []
+    for i in range(7):  # 7 job cards, 2 parts each
+        aid = staff.post("/api/appointments", json={"customer_id": karthik["id"], "appointment_date": days_ahead(1)}).json()["id"]
+        form = {"service_date": days_ahead(-i), "service_type": "Paid service", "job_card_no": f"70{i}", "jobs_done": "[]", "labour": "[]",
+                "parts": json.dumps([{"name": "Air filter", "qty": 1, "amount": 180}, {"name": "Element air cleaner", "qty": 1, "amount": 180}])}
+        r = staff.post(f"/api/appointments/{aid}/close", data=form, files=pdf)
+        assert r.status_code == 201, r.text
+        records.append((r.json()["id"], form))
+
+    # Pages of 4: 14 uses -> 4 + 4 + 4 + 2, newest first, each once.
+    seen, after = [], None
+    while True:
+        page = staff.get("/api/parts-usage/uses", params={"limit": 4, **({"after": after} if after else {})}).json()
+        assert page["total"] == 14
+        seen += page["items"]
+        after = page["next"]
+        if not after:
+            break
+    assert len(seen) == 14 and len({u["id"] for u in seen}) == 14
+    assert [u["date"] for u in seen] == sorted((u["date"] for u in seen), reverse=True)
+
+    # Search: card no., registration without spaces, customer, part.
+    search = lambda q: staff.get("/api/parts-usage/uses", params={"q": q}).json()["total"]
+    assert search("703") == 2 and search("element") == 7 and search(karthik["name"].split()[0]) == 14
+    assert search(karthik["vehicles"][0]["registration_number"].replace(" ", "").lower()) == 14
+    assert search("no such thing") == 0
+
+    # Editing a service rewrites its parts; deleting it removes them.
+    rid, form = records[0]
+    edited = {**form, "parts": json.dumps([{"name": "Air filter", "qty": 3, "amount": 180}])}
+    assert staff.patch(f"/api/service-records/{rid}", data=edited).status_code == 200
+    by_name = {p["name"]: p for p in staff.get("/api/parts-usage").json()["parts"]}
+    assert by_name["Air filter"]["qty"] == 9 and by_name["Element air cleaner"]["qty"] == 6
+    admin = _api_client(monkeypatch, admin=True)
+    assert admin.delete(f"/api/service-records/{records[1][0]}").status_code == 200
+    by_name = {p["name"]: p for p in admin.get("/api/parts-usage").json()["parts"]}
+    assert by_name["Air filter"]["qty"] == 8 and by_name["Element air cleaner"]["qty"] == 5
+
+    # Merge (admins): both spellings count as one part, its uses included.
+    assert staff.post("/api/parts-usage/merge", json={"part": "element air cleaner", "into": "Air filter"}).status_code == 403
+    assert admin.post("/api/parts-usage/merge", json={"part": "Air filter", "into": "air FILTER"}).status_code == 400
+    assert admin.post("/api/parts-usage/merge", json={"part": "Nothing", "into": "Air filter"}).status_code == 404
+    r = admin.post("/api/parts-usage/merge", json={"part": "element air cleaner", "into": "Air filter"})
+    assert r.status_code == 200, r.text
+    (merged,) = admin.get("/api/parts-usage").json()["parts"]
+    assert (merged["name"], merged["qty"], merged["services"]) == ("Air filter", 13, 6)
+    assert merged["merged"] == [{"key": "element air cleaner", "name": "Element air cleaner"}]
+    assert admin.get("/api/parts-usage/uses", params={"part": "air filter"}).json()["total"] == 11
+    # Merging the target onward takes its merged names along (no chains).
+    (close_extra,) = [a["id"] for a in db.get_appointments(karthik["id"])]  # reopened by the delete above
+    form = {**records[2][1], "parts": json.dumps([{"name": "Air cleaner element", "qty": 1, "amount": 180}])}
+    assert staff.post(f"/api/appointments/{close_extra}/close", data=form, files=pdf).status_code == 201
+    assert admin.post("/api/parts-usage/merge", json={"part": "air filter", "into": "Air cleaner element"}).status_code == 200
+    (merged,) = admin.get("/api/parts-usage").json()["parts"]
+    assert (merged["name"], merged["qty"]) == ("Air cleaner element", 14)
+    assert {m["key"] for m in merged["merged"]} == {"air filter", "element air cleaner"}
+
+    assert admin.delete("/api/parts-usage/merge", params={"part": "element air cleaner"}).status_code == 200
+    assert admin.delete("/api/parts-usage/merge", params={"part": "element air cleaner"}).status_code == 404
+    assert {p["name"]: p["qty"] for p in admin.get("/api/parts-usage").json()["parts"]} == {"Air cleaner element": 9, "Element air cleaner": 5}
+
+
+def test_parts_table_backfills_records_closed_before_it(db, monkeypatch):
+    """Records closed before service_record_parts existed get their rows at
+    startup, once."""
+    import json
+
+    client = _api_client(monkeypatch, admin=False)
+    karthik = db.get_customer_by_mobile("9876543210")
+    aid = client.post("/api/appointments", json={"customer_id": karthik["id"], "appointment_date": days_ahead(1)}).json()["id"]
+    form = {"service_date": days_ahead(0), "service_type": "Paid service", "jobs_done": "[]", "labour": "[]",
+            "parts": json.dumps([{"name": "Spark plug", "qty": 2, "amount": 150}])}
+    assert client.post(f"/api/appointments/{aid}/close", data=form, files={"report": ("c.pdf", PDF, "application/pdf")}).status_code == 201
+    conn = db._connect()
+    conn.cursor().execute("DELETE FROM service_record_parts")
+    conn.commit()
+    conn.close()
+    assert db.parts_usage()["parts"] == []
+    db.init_db()
+    db.init_db()  # a second start adds nothing
+    (plug,) = db.parts_usage()["parts"]
+    assert (plug["name"], plug["qty"], plug["amount"]) == ("Spark plug", 2, 300)
 
 
 def test_edit_a_closed_service(db, monkeypatch):

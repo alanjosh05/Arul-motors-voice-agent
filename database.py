@@ -283,6 +283,9 @@ INDEXES = [
     ("ix_voice_calls_open", "voice_calls", "ended_at, started_at"),
     ("ix_service_records_vehicle", "service_records", "vehicle_id, service_date"),
     ("ix_service_records_customer", "service_records", "customer_id"),
+    ("ix_record_parts_record", "service_record_parts", "record_id"),
+    ("ix_record_parts_date", "service_record_parts", "service_date, id"),
+    ("ix_record_parts_name", "service_record_parts", "name_key, service_date"),
 ]
 
 
@@ -575,6 +578,38 @@ def init_db():
     ) {t['table']}
     """)
 
+    # Parts used: one row per part per closed service, copied from the record's
+    # `parts` JSON whenever a service is closed, edited or deleted
+    # (_sync_record_parts), so Parts used adds them up with indexed SQL instead
+    # of reading every job card. service_date is copied in for the date filter.
+    name_t = "VARCHAR(160)" if using_mysql() else "TEXT"
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS service_record_parts (
+        id {t['pk']},
+        record_id INTEGER NOT NULL,
+        service_date {t['day']} NOT NULL,
+        name_key {name_t} NOT NULL,
+        name {name_t} NOT NULL,
+        part_no {t['str']},
+        qty INTEGER NOT NULL,
+        amount INTEGER NOT NULL,
+        warranty INTEGER NOT NULL DEFAULT 0
+    ) {t['table']}
+    """)
+
+    # Merged part names: job cards spell one part several ways ("Air filter",
+    # "Element air cleaner"); staff merge them so they count as one part.
+    cursor.execute(f"""
+    CREATE TABLE IF NOT EXISTS part_aliases (
+        alias_key {name_t} PRIMARY KEY,
+        alias_name {name_t} NOT NULL,
+        canonical_key {name_t} NOT NULL,
+        canonical_name {name_t} NOT NULL,
+        created_by {t['str']},
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) {t['table']}
+    """)
+
     # Showroom-wide settings changed from the CRM (admins), e.g. whether the
     # voice agent may take calls. One row per setting; missing = default.
     cursor.execute(f"""
@@ -611,6 +646,16 @@ def init_db():
 
     for name, table, columns in INDEXES:
         _ensure_index(cursor, name, table, columns)
+
+    # Fill service_record_parts for records closed before it existed (and
+    # repair any record missing its rows). Only records with parts and no rows.
+    cursor.execute("""
+    SELECT r.id FROM service_records r
+    WHERE r.parts IS NOT NULL AND r.parts NOT IN ('', '[]')
+      AND NOT EXISTS (SELECT 1 FROM service_record_parts p WHERE p.record_id = r.id)
+    """)
+    for row in cursor.fetchall():
+        _sync_record_parts(cursor, row["id"])
 
     # Seed demo customers if empty. Dates are relative to today so the demo
     # always has upcoming services to call about.
@@ -1611,6 +1656,7 @@ def close_service(appointment_id: str, details: dict, pdf: bytes | None, pdf_nam
             "INSERT INTO service_documents (record_id, filename, content_type, size_bytes, data) VALUES (?, ?, ?, ?, ?)",
             (record_id, _pdf_filename(pdf_name), "application/pdf", len(pdf), pdf),
         )
+        _sync_record_parts(cursor, record_id)
         cursor.execute("UPDATE service_appointments SET status = 'COMPLETED' WHERE id = ?", (booking["id"],))
         _move_bike_on(cursor, booking["vehicle_id"], record_id, rec)
         conn.commit()
@@ -1674,6 +1720,7 @@ def record_walk_in_service(vehicle_id: int, details: dict, pdf: bytes | None, pd
             "INSERT INTO service_documents (record_id, filename, content_type, size_bytes, data) VALUES (?, ?, ?, ?, ?)",
             (record_id, _pdf_filename(pdf_name), "application/pdf", len(pdf), pdf),
         )
+        _sync_record_parts(cursor, record_id)
         # An older service typed in afterwards doesn't move the bike back.
         _move_bike_on(cursor, vehicle_id, record_id, rec)
         conn.commit()
@@ -1716,6 +1763,7 @@ def update_service_record(record_id: int, details: dict, pdf: bytes | None = Non
             f"UPDATE service_records SET {assignments}, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             [*rec.values(), actor, record_id],
         )
+        _sync_record_parts(cursor, record_id)
         if pdf:
             cursor.execute(
                 "UPDATE service_documents SET filename = ?, size_bytes = ?, data = ?, created_at = CURRENT_TIMESTAMP "
@@ -1771,6 +1819,7 @@ def delete_service_record(record_id: int) -> tuple[bool, str]:
     latest_service = not is_repair and row is not None and row["id"] == record_id
     try:
         cursor.execute("DELETE FROM service_documents WHERE record_id = ?", (record_id,))
+        cursor.execute("DELETE FROM service_record_parts WHERE record_id = ?", (record_id,))
         cursor.execute("DELETE FROM service_records WHERE id = ?", (record_id,))
         if current["appointment_id"]:
             cursor.execute(
@@ -1870,91 +1919,253 @@ def list_service_records() -> list:
     return rows
 
 
-def parts_usage(start: str | None = None, end: str | None = None) -> dict:
-    """What the workshop has used: every part on the closed services' job cards,
-    added up by part name (case and spacing ignored), most used first.
+def _part_key(name) -> str:
+    """How part names are compared: case and spacing ignored."""
+    return " ".join(str(name or "").split()).lower()
 
-    {"parts": [{name, part_nos, qty, paid_qty, warranty_qty, services, amount,
-    last_used, uses: [every use, newest first: {record_id, date, service_type, job_card_no,
-    has_report, vehicle_id, registration_number, model, customer_id, customer_name, part_no,
-    qty, amount (₹ per unit), warranty}]}],
-    "totals": {...}}. `start`/`end` (YYYY-MM-DD, inclusive) limit by service date."""
+
+def _sync_record_parts(cursor, record_id: int) -> None:
+    """Rewrite one record's rows in service_record_parts from its `parts` JSON
+    (call inside the same transaction as the write to service_records)."""
+    cursor.execute("DELETE FROM service_record_parts WHERE record_id = ?", (record_id,))
+    cursor.execute("SELECT service_date, parts FROM service_records WHERE id = ?", (record_id,))
+    row = cursor.fetchone()
+    if not row:
+        return
+    try:
+        parts = json.loads(row["parts"]) if row["parts"] else []
+    except (TypeError, ValueError):
+        parts = []
+    for p in parts if isinstance(parts, list) else []:
+        name = " ".join(str(p.get("name") or "").split()) if isinstance(p, dict) else ""
+        if not name:
+            continue
+        cursor.execute(
+            "INSERT INTO service_record_parts (record_id, service_date, name_key, name, part_no, qty, amount, warranty) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (record_id, row["service_date"], name.lower(), name[:160], (p.get("part_no") or "").strip() or None,
+             int(p.get("qty") or 1), int(p.get("amount") or 0), 1 if p.get("warranty") else 0),
+        )
+
+
+# A part's key after merges: the name it was merged into, else its own.
+_PART = "COALESCE(a.canonical_key, p.name_key)"
+_PART_FROM = "FROM service_record_parts p LEFT JOIN part_aliases a ON a.alias_key = p.name_key"
+
+
+def _date_filter(start: str | None, end: str | None) -> tuple[list[str], list]:
     where, params = [], []
     if start:
-        where.append("r.service_date >= ?")
+        where.append("p.service_date >= ?")
         params.append(start)
     if end:
-        where.append("r.service_date <= ?")
+        where.append("p.service_date <= ?")
         params.append(end)
+    return where, params
+
+
+def parts_usage(start: str | None = None, end: str | None = None) -> dict:
+    """Parts used on closed services' job cards, added up per part (merged
+    names count as one), most used first. Small whatever the history: the
+    uses themselves come from parts_usage_uses, a page at a time.
+
+    {"parts": [{key, name, part_nos, merged: [{key, name}], qty, paid_qty,
+    warranty_qty, services, amount, last_used}], "totals": {kinds, qty, amount,
+    services}}. `start`/`end` (YYYY-MM-DD, inclusive) limit by service date."""
+    where, params = _date_filter(start, end)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
     conn = _connect()
     cursor = conn.cursor()
     cursor.execute(
         f"""
-    SELECT r.id, r.service_date, r.service_type, r.job_card_no, r.parts, r.vehicle_id, r.customer_id,
-           v.registration_number, v.model, c.name AS customer_name,
-           CASE WHEN d.record_id IS NULL THEN 0 ELSE 1 END AS has_report
-    FROM service_records r
-    JOIN vehicles v ON v.id = r.vehicle_id
-    JOIN customers c ON c.id = r.customer_id
-    LEFT JOIN service_documents d ON d.record_id = r.id
-    {'WHERE ' + ' AND '.join(where) if where else ''}
-    ORDER BY r.service_date DESC, r.id DESC
+    SELECT {_PART} AS part_key,
+           COALESCE(MAX(a.canonical_name), MIN(p.name)) AS name,
+           SUM(p.qty) AS qty,
+           SUM(CASE WHEN p.warranty = 1 THEN p.qty ELSE 0 END) AS warranty_qty,
+           SUM(CASE WHEN p.warranty = 1 THEN 0 ELSE p.qty * p.amount END) AS amount,
+           COUNT(DISTINCT p.record_id) AS services,
+           MAX(p.service_date) AS last_used
+    {_PART_FROM} {clause}
+    GROUP BY {_PART}
     """,
         params,
     )
-    rows = cursor.fetchall()
+    rows = [_plain(r) for r in cursor.fetchall()]
+    cursor.execute(
+        f"SELECT DISTINCT {_PART} AS part_key, p.part_no {_PART_FROM} "
+        f"WHERE p.part_no IS NOT NULL {'AND ' + ' AND '.join(where) if where else ''}",
+        params,
+    )
+    numbers: dict[str, list[str]] = {}
+    for r in cursor.fetchall():
+        numbers.setdefault(r["part_key"], []).append(r["part_no"])
+    cursor.execute("SELECT alias_key, alias_name, canonical_key FROM part_aliases ORDER BY alias_name")
+    merged: dict[str, list[dict]] = {}
+    for r in cursor.fetchall():
+        merged.setdefault(r["canonical_key"], []).append({"key": r["alias_key"], "name": r["alias_name"]})
+    cursor.execute(f"SELECT COUNT(DISTINCT p.record_id) AS n FROM service_record_parts p {clause}", params)
+    services = cursor.fetchone()["n"] or 0
     conn.close()
 
-    groups: dict[str, dict] = {}
-    services_with_parts = 0
-    for row in rows:
-        try:
-            parts = json.loads(row["parts"]) if row["parts"] else []
-        except (TypeError, ValueError):
-            parts = []
-        if not parts:
-            continue
-        services_with_parts += 1
-        for p in parts:
-            name = " ".join(str(p.get("name") or "").split())
-            if not name:
-                continue
-            qty = int(p.get("qty") or 1)
-            warranty = bool(p.get("warranty"))
-            g = groups.setdefault(
-                name.lower(),
-                {"name": name, "part_nos": [], "qty": 0, "paid_qty": 0, "warranty_qty": 0,
-                 "_services": set(), "amount": 0, "last_used": row["service_date"], "uses": []},
-            )
-            g["qty"] += qty
-            g["warranty_qty" if warranty else "paid_qty"] += qty
-            g["_services"].add(row["id"])
-            if not warranty:
-                g["amount"] += qty * int(p.get("amount") or 0)
-            part_no = (p.get("part_no") or "").strip()
-            if part_no and part_no not in g["part_nos"]:
-                g["part_nos"].append(part_no)
-            g["uses"].append({
-                "record_id": row["id"], "date": row["service_date"], "service_type": row["service_type"],
-                "job_card_no": row["job_card_no"], "has_report": bool(row["has_report"]),
-                "vehicle_id": row["vehicle_id"], "registration_number": row["registration_number"],
-                "model": row["model"], "customer_id": row["customer_id"], "customer_name": row["customer_name"],
-                "part_no": part_no or None, "qty": qty, "amount": int(p.get("amount") or 0), "warranty": warranty,
-            })
-    result = []
-    for g in groups.values():
-        g["services"] = len(g.pop("_services"))
-        result.append(g)
-    result.sort(key=lambda g: (-g["qty"], g["name"].lower()))
+    parts = []
+    for r in rows:
+        qty, warranty_qty = int(r["qty"] or 0), int(r["warranty_qty"] or 0)
+        parts.append({
+            "key": r["part_key"], "name": r["name"], "part_nos": sorted(numbers.get(r["part_key"], [])),
+            "merged": merged.get(r["part_key"], []), "qty": qty, "paid_qty": qty - warranty_qty,
+            "warranty_qty": warranty_qty, "services": int(r["services"] or 0), "amount": int(r["amount"] or 0),
+            "last_used": r["last_used"],
+        })
+    parts.sort(key=lambda g: (-g["qty"], g["name"].lower()))
     return {
-        "parts": result,
+        "parts": parts,
         "totals": {
-            "kinds": len(result),
-            "qty": sum(g["qty"] for g in result),
-            "amount": sum(g["amount"] for g in result),
-            "services": services_with_parts,
+            "kinds": len(parts), "qty": sum(g["qty"] for g in parts),
+            "amount": sum(g["amount"] for g in parts), "services": int(services),
         },
     }
+
+
+PARTS_PAGE = 50
+
+
+def parts_usage_uses(part: str | None = None, start: str | None = None, end: str | None = None,
+                     q: str | None = None, limit: int = PARTS_PAGE, after: str | None = None) -> dict:
+    """One page of part uses, newest first: which bike, whose, when, which job
+    card. `part` (a key from parts_usage) limits to one part, `q` searches part,
+    part no., bike, registration, customer and card no. Pages by keyset: pass the
+    returned `next` as `after` for the next page (stable while cards are added).
+
+    {"items": [...], "next": "YYYY-MM-DD|id" or None, "total": matching uses}."""
+    where, params = _date_filter(start, end)
+    if part:
+        where.append(f"{_PART} = ?")
+        params.append(_part_key(part))
+    words = [w for w in (q or "").lower().replace("%", " ").replace("_", " ").split() if w][:5]
+    for w in words:
+        where.append(
+            "(LOWER(p.name) LIKE ? OR LOWER(COALESCE(p.part_no, '')) LIKE ? OR LOWER(v.model) LIKE ? "
+            "OR LOWER(REPLACE(v.registration_number, ' ', '')) LIKE ? OR LOWER(c.name) LIKE ? "
+            "OR LOWER(COALESCE(r.job_card_no, '')) LIKE ?)"
+        )
+        like = f"%{w}%"
+        params += [like, like, like, like.replace(" ", ""), like, like]
+    base = f"""
+    FROM service_record_parts p
+    JOIN service_records r ON r.id = p.record_id
+    JOIN vehicles v ON v.id = r.vehicle_id
+    JOIN customers c ON c.id = r.customer_id
+    LEFT JOIN part_aliases a ON a.alias_key = p.name_key
+    """
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT COUNT(*) AS n {base} {clause}", params)
+    total = int(cursor.fetchone()["n"] or 0)
+
+    page_where, page_params = list(where), list(params)
+    if after:
+        try:
+            after_date, after_id = after.split("|")
+            after_id = int(after_id)
+        except ValueError as e:
+            conn.close()
+            raise ValueError("Invalid page cursor.") from e
+        page_where.append("(p.service_date < ? OR (p.service_date = ? AND p.id < ?))")
+        page_params += [after_date, after_date, after_id]
+    page_clause = ("WHERE " + " AND ".join(page_where)) if page_where else ""
+    cursor.execute(
+        f"""
+    SELECT p.id, p.record_id, p.service_date, p.name, {_PART} AS part_key, p.part_no, p.qty, p.amount,
+           p.warranty, r.service_type, r.job_card_no, r.vehicle_id, r.customer_id,
+           v.registration_number, v.model, c.name AS customer_name,
+           CASE WHEN EXISTS (SELECT 1 FROM service_documents d WHERE d.record_id = r.id) THEN 1 ELSE 0 END AS has_report
+    {base} {page_clause}
+    ORDER BY p.service_date DESC, p.id DESC
+    LIMIT {int(limit) + 1}
+    """,
+        page_params,
+    )
+    rows = [_plain(r) for r in cursor.fetchall()]
+    conn.close()
+    more = len(rows) > limit
+    rows = rows[:limit]
+    items = [{
+        "id": r["id"], "record_id": r["record_id"], "date": r["service_date"], "name": r["name"],
+        "part_key": r["part_key"], "part_no": r["part_no"], "qty": r["qty"], "amount": r["amount"],
+        "warranty": bool(r["warranty"]), "service_type": r["service_type"], "job_card_no": r["job_card_no"],
+        "has_report": bool(r["has_report"]), "vehicle_id": r["vehicle_id"],
+        "registration_number": r["registration_number"], "model": r["model"],
+        "customer_id": r["customer_id"], "customer_name": r["customer_name"],
+    } for r in rows]
+    next_cursor = f"{rows[-1]['service_date']}|{rows[-1]['id']}" if more and rows else None
+    return {"items": items, "next": next_cursor, "total": total}
+
+
+def _latest_part_name(cursor, key: str) -> str | None:
+    cursor.execute(
+        "SELECT name FROM service_record_parts WHERE name_key = ? ORDER BY service_date DESC, id DESC LIMIT 1", (key,)
+    )
+    row = cursor.fetchone()
+    return row["name"] if row else None
+
+
+def merge_part(part: str, into: str, actor: str | None = None) -> tuple[bool, str]:
+    """Count `part` as `into` from now on (both names as job cards spell them).
+    Parts already merged into `part` move to `into` too. Undo with unmerge_part."""
+    alias, target = _part_key(part), _part_key(into)
+    if not alias or not target:
+        return (False, "Choose both parts.")
+    conn = _connect()
+    cursor = conn.cursor()
+    # Merging into a part that was itself merged: use the part it went into.
+    cursor.execute("SELECT canonical_key, canonical_name FROM part_aliases WHERE alias_key = ?", (target,))
+    row = cursor.fetchone()
+    target_name = row["canonical_name"] if row else _latest_part_name(cursor, target)
+    if row:
+        target = row["canonical_key"]
+    alias_name = _latest_part_name(cursor, alias)
+    if alias_name is None or target_name is None:
+        conn.close()
+        return (False, "Part not found.")
+    if alias == target:
+        conn.close()
+        return (False, "Choose a different part to merge into.")
+    try:
+        cursor.execute(
+            "UPDATE part_aliases SET canonical_key = ?, canonical_name = ? WHERE canonical_key = ?",
+            (target, target_name, alias),
+        )
+        cursor.execute("DELETE FROM part_aliases WHERE alias_key = ?", (alias,))
+        cursor.execute(
+            "INSERT INTO part_aliases (alias_key, alias_name, canonical_key, canonical_name, created_by) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (alias, alias_name, target, target_name, actor),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+    _record_change(["service_records"])
+    return (True, f"{alias_name} now counts as {target_name}.")
+
+
+def unmerge_part(part: str) -> tuple[bool, str]:
+    """Count a merged part on its own again."""
+    conn = _connect()
+    cursor = conn.cursor()
+    key = _part_key(part)
+    cursor.execute("SELECT 1 FROM part_aliases WHERE alias_key = ?", (key,))
+    if cursor.fetchone() is None:
+        conn.close()
+        return (False, "Merged part not found.")
+    cursor.execute("DELETE FROM part_aliases WHERE alias_key = ?", (key,))
+    conn.commit()
+    conn.close()
+    _record_change(["service_records"])
+    return (True, "Unmerged.")
 
 
 def get_service_document(record_id: int) -> dict | None:
@@ -2385,6 +2596,10 @@ def delete_customer(customer_id: int) -> tuple[bool, str]:
         "DELETE FROM service_documents WHERE record_id IN (SELECT id FROM service_records WHERE customer_id = ?)",
         (customer_id,),
     )
+    cursor.execute(
+        "DELETE FROM service_record_parts WHERE record_id IN (SELECT id FROM service_records WHERE customer_id = ?)",
+        (customer_id,),
+    )
     for table in ("service_records", "call_logs", "service_appointments", "vehicles", "customer_services"):
         cursor.execute(f"DELETE FROM {table} WHERE customer_id = ?", (customer_id,))
     cursor.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
@@ -2477,6 +2692,10 @@ def delete_vehicle(vehicle_id: int) -> tuple[bool, str]:
         return (False, "Bike not found.")
     cursor.execute(
         "DELETE FROM service_documents WHERE record_id IN (SELECT id FROM service_records WHERE vehicle_id = ?)",
+        (vehicle_id,),
+    )
+    cursor.execute(
+        "DELETE FROM service_record_parts WHERE record_id IN (SELECT id FROM service_records WHERE vehicle_id = ?)",
         (vehicle_id,),
     )
     cursor.execute("DELETE FROM service_records WHERE vehicle_id = ?", (vehicle_id,))

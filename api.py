@@ -42,7 +42,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import auth
 import crm_export
@@ -836,11 +836,55 @@ def service_history(vehicle_id: int):
     return database.get_service_history(vehicle_id)
 
 
+DATE_PARAM = r"^\d{4}-\d{2}-\d{2}$"
+
+
 @api.get("/parts-usage")
-def parts_usage(start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"), end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$")):
-    """Parts used across the closed services' job cards, added up by part,
-    optionally between two service dates (inclusive)."""
-    return database.parts_usage(start, end)
+def parts_usage(start: str | None = Query(None, pattern=DATE_PARAM), end: str | None = Query(None, pattern=DATE_PARAM)):
+    """Parts used on closed services' job cards, one row per part (merged names
+    as one), between two service dates (inclusive). The uses: /parts-usage/uses."""
+    return cache.json_response(f"parts-usage:{start}:{end}", lambda: database.parts_usage(start, end))
+
+
+@api.get("/parts-usage/uses")
+def parts_usage_uses(
+    part: str | None = Query(None, max_length=160),
+    start: str | None = Query(None, pattern=DATE_PARAM),
+    end: str | None = Query(None, pattern=DATE_PARAM),
+    q: str | None = Query(None, max_length=80),
+    limit: int = Query(database.PARTS_PAGE, ge=1, le=200),
+    after: str | None = Query(None, max_length=40),
+):
+    """One page of part uses, newest first (bike, customer, date, job card).
+    `part` = one part's key; `after` = the previous page's `next`."""
+    try:
+        if (q and q.strip()) or after:
+            # Only first pages are cached: searches and deeper pages would each
+            # leave an entry in the (never-evicted) cache.
+            return database.parts_usage_uses(part, start, end, q, limit, after)
+        return cache.json_response(
+            f"parts-uses:{part}:{start}:{end}:{limit}",
+            lambda: database.parts_usage_uses(part, start, end, None, limit, None),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+class PartMergeIn(BaseModel):
+    part: str = Field(min_length=1, max_length=160)
+    into: str = Field(min_length=1, max_length=160)
+
+
+@api.post("/parts-usage/merge")
+def merge_part(body: PartMergeIn, user: dict = Depends(admin_user)):
+    """Admins: count one part name as another (job cards spell parts differently)."""
+    return _check(database.merge_part(body.part, body.into, actor=_actor(user)))
+
+
+@api.delete("/parts-usage/merge", dependencies=[Depends(admin_user)])
+def unmerge_part(part: str = Query(..., min_length=1, max_length=160)):
+    """Admins: count a merged part on its own again."""
+    return _check(database.unmerge_part(part))
 
 
 @api.get("/service-records/{record_id}/report")
