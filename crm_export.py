@@ -52,6 +52,9 @@ def _local_time(value) -> datetime | None:
     return moment.astimezone(database.SHOWROOM_TZ).replace(tzinfo=None)
 
 
+FORMULA_STARTS = ("=", "+", "-", "@", "\t", "\r")
+
+
 def _sheet(wb: Workbook, title: str, columns: list[tuple[str, int, str | None]], rows: list[list]) -> None:
     """columns: (header, width, number format or None)."""
     ws = wb.create_sheet(title)
@@ -62,6 +65,12 @@ def _sheet(wb: Workbook, title: str, columns: list[tuple[str, int, str | None]],
         cell.alignment = Alignment(vertical="center")
     for row in rows:
         ws.append(row)
+        # Text that starts like a formula (=, +, -, @) stays text: a customer
+        # named '=HYPERLINK(...)' must not become a live formula in Excel.
+        for cell in ws[ws.max_row]:
+            if isinstance(cell.value, str) and cell.value[:1] in FORMULA_STARTS:
+                cell.data_type = "s"
+                cell.quotePrefix = True
     for i, (_, width, fmt) in enumerate(columns, start=1):
         letter = get_column_letter(i)
         ws.column_dimensions[letter].width = width

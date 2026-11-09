@@ -382,6 +382,10 @@ def init_db():
     ) {t['table']}
     """)
 
+    # Bumped to sign a user out everywhere (password change, "sign out of all
+    # devices"): tokens carry the version they were issued with.
+    _ensure_column(cursor, "staff_users", "token_version", "INTEGER NOT NULL DEFAULT 0")
+
     # The showroom's people (CRM page "Our staff"): sales, spares and mechanics.
     # Not CRM logins (those are staff_users). Mechanics fill the job card's
     # mechanic field.
@@ -3526,9 +3530,22 @@ def count_staff_users() -> int:
 
 
 def set_staff_password(user_id: int, password_hash: str) -> None:
+    """New password; every session signed in with the old one ends."""
     conn = _connect()
     cursor = conn.cursor()
-    cursor.execute("UPDATE staff_users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
+    cursor.execute(
+        "UPDATE staff_users SET password_hash = ?, token_version = COALESCE(token_version, 0) + 1 WHERE id = ?",
+        (password_hash, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def end_staff_sessions(user_id: int) -> None:
+    """Sign a user out on every device (their tokens stop working)."""
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE staff_users SET token_version = COALESCE(token_version, 0) + 1 WHERE id = ?", (user_id,))
     conn.commit()
     conn.close()
 

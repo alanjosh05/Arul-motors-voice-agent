@@ -113,7 +113,16 @@ async def lifespan(_app: FastAPI):
         await task
 
 
-app = FastAPI(title="Arul Motors Yamaha (Nazareth, Thoothukudi) ERP API", lifespan=lifespan)
+# The interactive docs and openapi.json describe every endpoint: a map for an
+# attacker. Off unless API_DOCS=1 (local development).
+_DOCS = os.getenv("API_DOCS") == "1"
+app = FastAPI(
+    title="Arul Motors Yamaha (Nazareth, Thoothukudi) ERP API",
+    lifespan=lifespan,
+    docs_url="/docs" if _DOCS else None,
+    redoc_url="/redoc" if _DOCS else None,
+    openapi_url="/openapi.json" if _DOCS else None,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +185,27 @@ def _has_valid_credentials(request: Request) -> bool:
     return bool(expected and key and secrets.compare_digest(key, expected))
 
 
+# Sent with every API response. The API returns data, never pages, so the
+# content policy allows nothing to run or embed; browsers must use HTTPS for
+# two years; no other site may frame it; no referrer leaks.
+SECURITY_HEADERS = {
+    "Strict-Transport-Security": "max-age=63072000; includeSubDomains",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+    "Cross-Origin-Resource-Policy": "same-site",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+}
+
+
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for name, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    return response
+
+
 @app.middleware("http")
 async def etag_middleware(request: Request, call_next):
     """Conditional GETs: browsers revalidate with If-None-Match and get an
@@ -195,8 +225,14 @@ async def etag_middleware(request: Request, call_next):
     return response
 
 
+# Registered last, so it wraps the others and also covers their early replies (304s).
+app.middleware("http")(security_headers)
+
+
 class LoginThrottle:
-    """At most MAX_FAILURES failed sign-ins per client per WINDOW_SECS."""
+    """At most MAX_FAILURES failed sign-ins per key (a client address, or a
+    username, so guessing one account from many addresses is limited too) per
+    WINDOW_SECS."""
 
     MAX_FAILURES = 10
     WINDOW_SECS = 15 * 60
@@ -240,9 +276,9 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,  # tokens travel in the Authorization header, not cookies
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "If-None-Match", "X-API-Key"],
     # Lets the CRM (another domain) read download file names.
     expose_headers=["Content-Disposition"],
 )
@@ -274,6 +310,16 @@ bootstrap_admin()
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
+def _user_for_token(token: str) -> dict | None:
+    """The staff member a token belongs to, if it's signed, unexpired, and
+    issued since their last password change / "sign out everywhere"."""
+    payload = auth.read_token(token)
+    user = database.get_staff_user(user_id=payload["sub"]) if payload else None
+    if not user or int(payload.get("ver", 0)) != int(user.get("token_version") or 0):
+        return None
+    return user
+
+
 def current_user(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None),
@@ -281,8 +327,7 @@ def current_user(
     """Staff member from `Authorization: Bearer <token>`. Scripts may instead
     send `X-API-Key` when API_KEY is set (treated as an admin)."""
     if authorization and authorization.lower().startswith("bearer "):
-        payload = auth.read_token(authorization.split(" ", 1)[1].strip())
-        user = database.get_staff_user(user_id=payload["sub"]) if payload else None
+        user = _user_for_token(authorization.split(" ", 1)[1].strip())
         if user:
             _check_shift(user)
             return user
@@ -324,14 +369,18 @@ class LoginIn(BaseModel):
 
 @app.post("/api/auth/login")
 def login(body: LoginIn, request: Request):
-    client = _client_ip(request)
-    if login_throttle.blocked(client):
+    keys = [f"ip:{_client_ip(request)}", f"user:{(body.username or '').strip().lower()[:100]}"]
+    if any(login_throttle.blocked(key) for key in keys):
         raise HTTPException(status_code=429, detail="Too many failed sign-ins. Try again in 15 minutes.")
     user = database.get_staff_user(username=body.username, with_hash=True)
-    if not user or not auth.verify_password(body.password, user["password_hash"]):
-        login_throttle.failed(client)
+    # Same work whether or not the username exists (no username guessing by timing).
+    if not auth.verify_password_or_dummy(body.password[:auth.MAX_PASSWORD_LENGTH], user["password_hash"] if user else None):
+        for key in keys:
+            login_throttle.failed(key)
+        logger.warning("Failed sign-in for %r from %s", (body.username or "")[:40], keys[0][3:])
         raise HTTPException(status_code=401, detail="Wrong username or password.")
-    login_throttle.succeeded(client)
+    for key in keys:
+        login_throttle.succeeded(key)
     user.pop("password_hash")
     _check_shift(user)  # after the password check, so it says nothing about wrong logins
     return {"token": auth.create_token(user), "user": user}
@@ -350,8 +399,7 @@ async def live_socket(websocket: WebSocket, token: str = ""):
     token comes as ?token=. Messages: {"id", "type", "data", "at"} with type
     data.changed, call.started, call.ended or notification; first a "hello"
     snapshot with calls in progress and recent notifications."""
-    payload = auth.read_token(token) if token else None
-    user = await asyncio.to_thread(database.get_staff_user, user_id=payload["sub"]) if payload else None
+    user = await asyncio.to_thread(_user_for_token, token) if token else None
     if not user:
         await websocket.close(code=4401)
         return
@@ -401,10 +449,20 @@ def change_password(body: PasswordIn, user: dict = Depends(current_user)):
     stored = database.get_staff_user(user_id=user["id"], with_hash=True)
     if not stored or not auth.verify_password(body.current_password, stored["password_hash"]):
         raise HTTPException(status_code=400, detail="Current password is wrong.")
-    if problem := auth.password_problem(body.new_password):
+    if problem := auth.password_problem(body.new_password, user["username"]):
         raise HTTPException(status_code=400, detail=problem)
     database.set_staff_password(user["id"], auth.hash_password(body.new_password))
-    return {"message": "Password changed."}
+    # Every other device is signed out; this one gets a new token.
+    fresh = database.get_staff_user(user_id=user["id"])
+    return {"message": "Password changed. Other devices are signed out.", "token": auth.create_token(fresh), "user": fresh}
+
+
+@api.post("/auth/logout-all")
+def logout_everywhere(user: dict = Depends(current_user)):
+    """End every session of this user, on every device (this one included)."""
+    if user["id"]:
+        database.end_staff_sessions(user["id"])
+    return {"message": "Signed out on every device."}
 
 
 # ---------------------------------------------------------------------------
@@ -1134,7 +1192,7 @@ def get_staff():
 
 @api.post("/staff", status_code=201, dependencies=[Depends(admin_user)])
 def create_staff(body: StaffIn):
-    if problem := auth.password_problem(body.password):
+    if problem := auth.password_problem(body.password, body.username):
         raise HTTPException(status_code=400, detail=problem)
     return _check(
         database.create_staff_user(body.username, auth.hash_password(body.password), body.full_name, body.role)

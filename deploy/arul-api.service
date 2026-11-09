@@ -13,5 +13,31 @@ ExecStart=/opt/arul-motors/.venv/bin/uvicorn api:app --host 127.0.0.1 --port 800
 Restart=always
 RestartSec=3
 
+# Sandbox (systemd): the app can write only its own folder; the rest of the
+# system is read-only or hidden; it can't gain privileges, load kernel
+# modules, change kernel settings or use raw devices. A bug in the app (or a
+# library) then can't be used to take over the server.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/arul-motors
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UMask=0077
+ProtectHome=yes
+
 [Install]
 WantedBy=multi-user.target

@@ -1,10 +1,24 @@
 # HTTPS reverse proxy for the backend. Caddy gets and renews the certificates
 # automatically once DNS for both domains points at this VM.
 
+# Security headers for both sites: HTTPS only (2 years), no framing by other
+# sites, no MIME sniffing, no referrer, and don't say which server this is.
+(security) {
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+		-Via
+	}
+}
+
 # Voice agent. Basic auth keeps strangers from opening the voice page and
 # running up Gemini charges. Make the hash with:  caddy hash-password
 VOICE_DOMAIN {
 	# Compress the voice page's scripts (~1 MB of JS) and API replies.
+	import security
 	encode zstd gzip
 	basic_auth {
 		VOICE_USER VOICE_PASSWORD_HASH
@@ -15,6 +29,7 @@ VOICE_DOMAIN {
 # Dashboard API, called by the frontend on GoDaddy. Protected by API_KEY
 # (X-API-Key header) and CORS_ORIGINS in the app itself.
 API_DOMAIN {
+	import security
 	encode zstd gzip
 	reverse_proxy 127.0.0.1:8001
 }

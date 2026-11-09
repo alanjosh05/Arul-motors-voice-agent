@@ -527,13 +527,83 @@ def test_staff_login_tokens_and_roles(db, monkeypatch):
     assert admin.post("/api/auth/login", json={"username": "admin1", "password": "wrong"}).status_code == 401
     assert admin.get("/api/auth/me").json()["role"] == "admin"
     # Admins manage staff; staff can't.
-    created = admin.post("/api/staff", json={"username": "ravi", "password": "password123", "full_name": "Ravi"})
+    created = admin.post("/api/staff", json={"username": "ravi", "password": "Bay2-Oil-Kumar", "full_name": "Ravi"})
     assert created.status_code == 201
     assert admin.post("/api/staff", json={"username": "x", "password": "short"}).status_code == 400
     staff = _api_client(monkeypatch, admin=False)
     assert staff.get("/api/staff").status_code == 403
-    assert staff.post("/api/auth/password", json={"current_password": "password123", "new_password": "newpassword9"}).status_code == 200
+    changed = staff.post("/api/auth/password", json={"current_password": "password123", "new_password": "newpassword9"})
+    assert changed.status_code == 200
+    # The old session ends with the password change; the reply carries a new one.
+    assert staff.get("/api/auth/me").status_code == 401
+    staff.headers["Authorization"] = f"Bearer {changed.json()['token']}"
+    assert staff.get("/api/auth/me").json()["username"] == "staff1"
     assert staff.post("/api/auth/login", json={"username": "staff1", "password": "newpassword9"}).status_code == 200
+
+
+def test_security_hardening(db, monkeypatch):
+    """Strong passwords; per-account sign-in limits; no username guessing;
+    sign out everywhere; security headers; no public API map; Excel cells
+    that look like formulas stay text."""
+    import io
+
+    from fastapi.testclient import TestClient
+    from openpyxl import load_workbook
+
+    import api
+    import auth
+
+    # Weak passwords are refused: common, too simple, or holding the username.
+    for weak in ("password123", "Password@2026", "arulmotors2026", "1234567890", "aaaaaaaaaa", "qwerty12345"):
+        assert auth.password_problem(weak) is not None, weak
+    assert auth.password_problem("ravi-Bay2-2026", "ravi") is not None
+    assert auth.password_problem("x" * 129) is not None
+    assert auth.password_problem("Bay2-Oil-Kumar", "ravi") is None
+
+    admin = _api_client(monkeypatch)
+    anon = TestClient(api.app)
+    # Unknown user and wrong password look the same.
+    a = anon.post("/api/auth/login", json={"username": "nobody", "password": "Whatever-123"})
+    b = anon.post("/api/auth/login", json={"username": "admin1", "password": "Whatever-123"})
+    assert (a.status_code, a.json()) == (b.status_code, b.json()) == (401, {"detail": "Wrong username or password."})
+
+    # Guessing one account from many addresses is limited too.
+    monkeypatch.setattr(api.LoginThrottle, "MAX_FAILURES", 3)
+    api.login_throttle._failures.clear()
+    for i in range(3):
+        r = anon.post("/api/auth/login", json={"username": "ADMIN1", "password": "wrong"}, headers={"X-Forwarded-For": f"10.0.0.{i}"})
+        assert r.status_code == 401
+    right = anon.post("/api/auth/login", json={"username": "admin1", "password": "password123"}, headers={"X-Forwarded-For": "10.9.9.9"})
+    assert right.status_code == 429
+    api.login_throttle._failures.clear()
+
+    # Sign out everywhere: every token issued before it stops working.
+    other_device = TestClient(api.app)
+    other_device.headers["Authorization"] = "Bearer " + anon.post("/api/auth/login", json={"username": "admin1", "password": "password123"}).json()["token"]
+    assert other_device.get("/api/auth/me").status_code == 200
+    assert admin.post("/api/auth/logout-all").status_code == 200
+    assert admin.get("/api/auth/me").status_code == 401 and other_device.get("/api/auth/me").status_code == 401
+    with pytest.raises(Exception):  # the live feed refuses it too
+        with other_device.websocket_connect(f"/api/ws?token={other_device.headers['Authorization'][7:]}") as ws:
+            ws.receive_text()
+
+    # Security headers on every reply (data, errors and 304s alike); no API map.
+    admin = _api_client(monkeypatch)
+    first = admin.get("/api/customers")
+    for r in (anon.get("/api/health"), anon.get("/api/customers"), first,
+              admin.get("/api/customers", headers={"If-None-Match": first.headers["etag"]})):
+        assert r.headers["strict-transport-security"].startswith("max-age=63072000")
+        assert r.headers["x-frame-options"] == "DENY" and r.headers["x-content-type-options"] == "nosniff"
+        assert "default-src 'none'" in r.headers["content-security-policy"]
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert anon.get(path).status_code == 404
+
+    # A customer named like a formula exports as plain text, not a live formula.
+    evil = '=HYPERLINK("http://evil.example","Click")'
+    assert admin.post("/api/customers", json={"name": evil, "mobile_number": "9000000099"}).status_code == 201
+    sheet = load_workbook(io.BytesIO(admin.get("/api/admin/export.xlsx").content))["Customers & Bikes"]
+    cell = next(c for row in sheet.iter_rows() for c in row if c.value == evil)
+    assert cell.data_type == "s" and cell.quotePrefix
 
 
 def test_crm_customers_vehicles_bookings_and_stats(db, monkeypatch):

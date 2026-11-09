@@ -3,7 +3,9 @@
 Standard library only:
 - Passwords: scrypt with a random salt, stored as "scrypt$n$r$p$salt$hash".
 - Tokens: base64url(JSON payload) + "." + base64url(HMAC-SHA256 signature),
-  signed with AUTH_SECRET. They carry the user id, username, role and expiry.
+  signed with AUTH_SECRET. They carry the user id, username, role, expiry and
+  the user's token version: bumping it (password change, "sign out
+  everywhere") makes every token issued before it invalid.
 """
 
 import base64
@@ -18,7 +20,19 @@ import time
 logger = logging.getLogger("arul-motors-auth")
 
 TOKEN_TTL_SECS = int(os.getenv("AUTH_TOKEN_TTL_HOURS", "12")) * 3600
-MIN_PASSWORD_LENGTH = 8
+MIN_PASSWORD_LENGTH = 10
+MAX_PASSWORD_LENGTH = 128
+
+# Passwords guessed first in real attacks (and obvious ones for this showroom).
+# Compared case-insensitively with digits and symbols at the end removed, so
+# "Password@123" and "arulmotors2026" are caught too.
+COMMON_PASSWORDS = {
+    "password", "passw0rd", "qwerty", "qwertyuiop", "asdfgh", "zxcvbn", "abc", "abcd", "abcdef",
+    "letmein", "welcome", "admin", "administrator", "root", "user", "login", "test", "guest",
+    "iloveyou", "monkey", "dragon", "master", "sunshine", "princess", "football", "cricket",
+    "india", "chennai", "tamilnadu", "yamaha", "arul", "arulmotors", "motors", "nazareth",
+    "thoothukudi", "tuticorin", "showroom", "service", "changeme", "secret",
+}
 
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2**14, 8, 1
 _fallback_secret: str | None = None
@@ -65,9 +79,35 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
-def password_problem(password: str) -> str | None:
-    if len(password or "") < MIN_PASSWORD_LENGTH:
+# A real hash of a random password: a sign-in for a username that doesn't
+# exist is checked against it, so it takes as long as a wrong password and
+# the reply time doesn't reveal which usernames exist.
+_DUMMY_HASH = hash_password(secrets.token_hex(16))
+
+
+def verify_password_or_dummy(password: str, stored: str | None) -> bool:
+    """verify_password, spending the same time when there's no such user."""
+    if stored is None:
+        verify_password(password, _DUMMY_HASH)
+        return False
+    return verify_password(password, stored)
+
+
+def password_problem(password: str, username: str | None = None) -> str | None:
+    """Why a new password isn't acceptable, or None."""
+    password = password or ""
+    if len(password) < MIN_PASSWORD_LENGTH:
         return f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+    if len(password) > MAX_PASSWORD_LENGTH:
+        return f"Password must be at most {MAX_PASSWORD_LENGTH} characters."
+    lowered = password.lower()
+    core = lowered.rstrip("0123456789!@#$%^&*._-+= ")
+    if len(set(lowered)) < 4 or lowered.isdigit():
+        return "Password is too simple. Mix words, numbers and symbols."
+    if core in COMMON_PASSWORDS or lowered in COMMON_PASSWORDS:
+        return "That password is too common. Choose one that's hard to guess."
+    if username and len(username) >= 3 and username.strip().lower() in lowered:
+        return "Password must not contain the username."
     return None
 
 
@@ -79,6 +119,7 @@ def create_token(user: dict, ttl_secs: int = TOKEN_TTL_SECS) -> str:
         "sub": user["id"],
         "username": user["username"],
         "role": user["role"],
+        "ver": int(user.get("token_version") or 0),
         "exp": int(time.time()) + ttl_secs,
     }
     body = _b64(json.dumps(payload, separators=(",", ":")).encode())

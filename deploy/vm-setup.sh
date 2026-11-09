@@ -85,6 +85,15 @@ fi
 if ! grep -q "encode zstd gzip" /etc/caddy/Caddyfile; then
   sed -i -E "s/^(${VOICE_DOMAIN//./\\.}|${API_DOMAIN//./\\.}) \{$/\1 {\n\tencode zstd gzip/" /etc/caddy/Caddyfile
 fi
+# Security headers (added 2026-11-09): servers set up before then get the
+# (security) snippet and an "import security" in each site, once.
+if ! grep -q "^(security)" /etc/caddy/Caddyfile; then
+  awk '/^\(security\) \{/,/^}/' "$SRC/deploy/Caddyfile" > /tmp/caddy-security
+  { cat /tmp/caddy-security; echo; cat /etc/caddy/Caddyfile; } > /tmp/Caddyfile.new
+  sed -i -E "s/^(${VOICE_DOMAIN//./\\.}|${API_DOMAIN//./\\.}) \{$/\1 {\n\timport security/" /tmp/Caddyfile.new
+  install -m 644 /tmp/Caddyfile.new /etc/caddy/Caddyfile
+  rm -f /tmp/caddy-security /tmp/Caddyfile.new
+fi
 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
 systemctl reload caddy || systemctl restart caddy
 
